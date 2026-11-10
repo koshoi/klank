@@ -66,12 +66,22 @@ The container entrypoint:
 
 ### pi extensions
 
-- **`klank/bridge.ts`** — the bridge for external messages: watches
-  `/tmp/pi-inbox` inside the container; any `msg-<id>` file dropped there is
-  removed and injected into the running pi session as if typed by the user,
-  so it shows up in the TUI transcript like any other message. If the agent
-  is mid-run, the message is queued as a steering message. This is what
-  powers `klank send` (see below).
+- **`klank/bridge.ts`** — the bridge for external control: runs an HTTP
+  server inside the container (port from `KLANK_PORT`, default 8089).
+  `klank new` publishes the port on the host's loopback
+  (`-p 127.0.0.1:<port>:<port>`) and records it in the database, so the
+  klank CLI (or plain curl) can talk to the running pi session:
+
+  - `GET /health` — liveness probe
+  - `GET /status` — agent state: busy/idle, model, session, context usage
+  - `POST /message` — body is injected as a user message (queued as a
+    steering message when the agent is mid-run); `?wait=1` long-polls until
+    the agent settles, which is what powers `klank send -w` with no
+    client-side polling
+
+  For compatibility with older klank binaries the legacy file spool
+  `/tmp/pi-inbox` is still watched: any `msg-<id>` file dropped there is
+  removed and injected exactly like `POST /message`.
 - **`extensions/edit-guard.ts`** — snapshot-based edit guardrails: tracks a
   content hash of every file the model has read and blocks `edit`/`write`
   calls against files that changed since (catching out-of-band mutations),
@@ -84,17 +94,26 @@ The container entrypoint:
   are markdown files with frontmatter (`name`, `description`, `tools`,
   `model`) in `~/.pi/agent/agents/`; bundled ones: `scout`, `planner`,
   `reviewer`, `worker`. Children run with `KLANK_SUBAGENT=1`, which tells
-  the bridge not to watch the inbox (only the top-level session consumes
-  `klank send` messages). See `extensions/subagents/README.md`.
+  the bridge not to start the control server or watch the inbox (only the
+  top-level session consumes `klank send` messages). See
+  `extensions/subagents/README.md`.
 
-Receipts written by the bridge, next to the message file:
+Receipts for legacy spool messages, written next to the message file:
 
 - `msg-<id>.sent` — delivered to the agent (content: `started` or `queued`)
 - `msg-<id>.done` — agent settled after the message
 - `msg-<id>.error` — delivery failed
 
 Agents started from older images without the bridge reject `send` with a
-write error — rebuild the image and start a new agent.
+write error — rebuild the image and start a new agent. Agents started from
+images without the control server fall back to the spool automatically
+(port `0` in the database).
+
+Debug an agent's control server directly from the host:
+
+```sh
+curl http://127.0.0.1:<port>/status
+```
 
 ## The klank CLI
 
@@ -152,6 +171,9 @@ klank send [-w] [--timeout s] <id|name> <text...>
                   send a message to a running agent's pi session
                   (without text arguments, the message is read from
                   stdin; requires the bridge extension in the image)
+klank status <id|name>
+                  show an agent's live state (busy/idle, model, session,
+                  context usage) via its control server
 klank debug query <sql>
                   run a read-only SQL query against the database
 klank debug data  show table schemas
@@ -183,6 +205,7 @@ Examples:
 klank send agent001 fix the failing test in foo.go
 echo "multi-line\nmessage" | klank send agent001
 klank send -w agent001 run the test suite
+klank status agent001
 ```
 
 ### Configuration
@@ -201,7 +224,13 @@ Keys:
 - `image` — default container image for `klank new`
 - `env_file` — dotenv-style file whose `KEY=VALUE` lines are passed to the
   container (comments, blank lines and `export ` prefixes are supported;
-  `-e` flags override it)
+  `-e` flags override it). Secrets are staged as `0600` files in a private
+  `/tmp/klank-secrets-*` directory on the host, bind-mounted read-write at
+  `/secrets` in the container, and wrapped at startup: each file is
+  exported as an env var and deleted immediately after it is read, both
+  inside the container and on the host (bind mount). Secrets therefore
+  never appear in `docker inspect`, process listings, or `docker run`
+  arguments, and are gone from disk right after first use.
 
 ### Database
 

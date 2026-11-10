@@ -26,6 +26,22 @@ import (
 type Config struct {
 	Image   string `toml:"image"`    // default container image for "klank new"
 	EnvFile string `toml:"env_file"` // path to a default env file passed to the container
+	IPv6    *bool  `toml:"ipv6"`     // launch agents on an IPv6-enabled docker network (default false; nil means default)
+}
+
+// DefaultIPv6 is the built-in default for IPv6 agent networking. Agents run
+// on the default (IPv4-only) bridge unless IPv6 is explicitly enabled via
+// config (ipv6 = true) or the --ipv6 flag. Outbound IPv6 additionally
+// requires the host to have IPv6 connectivity; when the network cannot be
+// set up, klank warns and falls back to the default bridge.
+const DefaultIPv6 = false
+
+// UseIPv6 reports whether agents should use the IPv6 docker network.
+func (c *Config) UseIPv6() bool {
+	if c.IPv6 == nil {
+		return DefaultIPv6
+	}
+	return *c.IPv6
 }
 
 // DefaultImage is the built-in default container image.

@@ -4,6 +4,7 @@ package command
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"strings"
@@ -38,6 +39,60 @@ func dockerImageHash(cid string) string {
 		return ""
 	}
 	return strings.TrimSpace(string(out))
+}
+
+// dockerImageCommand returns the image's configured entrypoint and cmd
+// so the secrets wrapper can exec them after exporting the mounted
+// secrets (empty when lookup/parse fails or the image sets neither).
+func dockerImageCommand(image string) (entrypoint, cmd []string) {
+	out, err := exec.Command("docker", "image", "inspect", image).Output()
+	if err != nil {
+		cli.Debug("image command lookup failed: %v", err)
+		return nil, nil
+	}
+	var imgs []struct {
+		Config struct {
+			Entrypoint []string
+			Cmd        []string
+		}
+	}
+	if err := json.Unmarshal(out, &imgs); err != nil || len(imgs) == 0 {
+		cli.Debug("image command parse failed: %v", err)
+		return nil, nil
+	}
+	return imgs[0].Config.Entrypoint, imgs[0].Config.Cmd
+}
+
+// shQuote single-quotes a string for safe interpolation into a POSIX
+// shell command (handles embedded quotes).
+func shQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// secretsWrapper builds the body of a `sh -c` script that exports each
+// file in /secrets as an env var, deletes the file immediately after
+// reading it (bind mount: this removes it on the host too), then execs
+// the image's original entrypoint/cmd, falling back to an interactive
+// shell when the image sets neither.
+func secretsWrapper(entrypoint, cmd []string) string {
+	var b strings.Builder
+	b.WriteString("set -eu\n" +
+		"for f in /secrets/*; do\n" +
+		"  [ -f \"$f\" ] || continue\n" +
+		"  key=$(basename \"$f\")\n" +
+		"  val=$(cat \"$f\")\n" +
+		"  export \"$key=$val\"\n" +
+		"  rm -f -- \"$f\"\n" +
+		"done\n" +
+		"exec")
+	for _, a := range append(append([]string{}, entrypoint...), cmd...) {
+		b.WriteString(" " + shQuote(a))
+	}
+	if len(entrypoint) == 0 && len(cmd) == 0 {
+		b.WriteString(" sh")
+	}
+	b.WriteString("\n")
+	return b.String()
 }
 
 // dockerAttach attaches the current terminal to a running container.

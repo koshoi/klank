@@ -32,6 +32,11 @@ func Fatal(format string, a ...any) {
 	os.Exit(1)
 }
 
+// Warn prints a [warn] line to stderr without exiting.
+func Warn(format string, a ...any) {
+	fmt.Fprintf(os.Stderr, "[warn] "+format+"\n", a...)
+}
+
 // MustCwd returns the current working directory or exits.
 func MustCwd() string {
 	cwd, err := os.Getwd()

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"strings"
@@ -15,14 +16,16 @@ import (
 	"klank/storage"
 )
 
-// inboxDir is the bridge extension's spool directory inside the container
-// (see klank/bridge.ts).
+// inboxDir is the legacy bridge spool directory inside the container (see
+// klank/bridge.ts). Used only for agents started before klank published
+// control ports (port == 0 in the database).
 const inboxDir = "/tmp/pi-inbox"
 
 // Send implements `klank send`: deliver a message to an agent's running pi
-// session by dropping it into the bridge inbox inside the container. The
-// bridge extension picks it up and injects it as a user message (it shows
-// up in the TUI as if typed there).
+// session. New agents expose a control server on a published loopback port
+// (bridge.ts); the message is POSTed to /message, optionally long-polled
+// via ?wait=1 until the agent settles. It shows up in the TUI as if typed
+// there.
 //
 //	klank send [-w] [--timeout s] <id|name> <text...>
 //
@@ -75,7 +78,7 @@ func Send(db *sql.DB, args []string) {
 		cli.Fatal("empty message")
 	}
 
-	cid, _, _, ok := storage.GetAgentTmux(db, idOrName)
+	cid, port, ok := storage.GetAgentPort(db, idOrName)
 	if !ok {
 		cli.Fatal("no such agent: %s", idOrName)
 	}
@@ -83,23 +86,11 @@ func Send(db *sql.DB, args []string) {
 		cli.Fatal("container %s is not running", shortCid(cid))
 	}
 
-	// write to a tmp file, then rename: the bridge's fs.watch sees the
-	// rename event only after the content is fully written
-	id := fmt.Sprintf("msg-%d", time.Now().UnixNano())
-	p := fmt.Sprintf("%s/%s", inboxDir, id)
-	script := fmt.Sprintf(`umask 0000; cat > '%s.tmp' && mv '%s.tmp' '%s'`, p, p, p)
-	write := exec.Command("docker", "exec", "-i", cid, "sh", "-c", script)
-	write.Stdin = strings.NewReader(message)
-	var stderr bytes.Buffer
-	write.Stderr = &stderr
-	cli.Debug("writing message %s to %s", id, shortCid(cid))
-	if err := write.Run(); err != nil {
-		cli.Fatal("write to bridge inbox: %v (%s)\nhint: the klank bridge extension must be loaded in the agent's pi session (rebuild the image and start a new agent)", err, strings.TrimSpace(stderr.String()))
-	}
-
-	status := "sent"
-	if wait {
-		status = waitForReceipt(cid, id, time.Duration(timeout)*time.Second)
+	var id, status string
+	if port > 0 {
+		id, status = sendHTTP(port, message, wait, time.Duration(timeout)*time.Second)
+	} else {
+		id, status = sendSpool(cid, message, wait, time.Duration(timeout)*time.Second)
 	}
 
 	if cli.IsJSON() {
@@ -113,6 +104,61 @@ func Send(db *sql.DB, args []string) {
 		return
 	}
 	fmt.Printf("%s: %s (%s)\n", status, id, idOrName)
+}
+
+// bridgeResponse is the JSON returned by the bridge control server.
+type bridgeResponse struct {
+	ID     string `json:"id"`
+	Status string `json:"status"`
+	Error  string `json:"error"`
+}
+
+// sendHTTP delivers the message via the bridge control server. With wait it
+// long-polls (?wait=1): the server holds the response until the agent
+// settles, so no client-side polling is needed.
+func sendHTTP(port int, message string, wait bool, timeout time.Duration) (id, status string) {
+	url := fmt.Sprintf("http://127.0.0.1:%d/message", port)
+	if wait {
+		url += "?wait=1"
+	}
+	client := &http.Client{Timeout: timeout}
+	resp, err := client.Post(url, "text/plain", strings.NewReader(message))
+	if err != nil {
+		cli.Fatal("control server on port %d: %v\nhint: the agent's bridge extension must be loaded (rebuild the image and start a new agent)", port, err)
+	}
+	defer resp.Body.Close()
+	var br bridgeResponse
+	if err := json.NewDecoder(resp.Body).Decode(&br); err != nil {
+		cli.Fatal("decode control server response: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		cli.Fatal("bridge rejected the message: %s", br.Error)
+	}
+	if br.Status == "done" {
+		return "msg-http", "done"
+	}
+	return "msg-http", br.Status
+}
+
+// sendSpool is the legacy transport: write the message into the bridge
+// inbox inside the container (tmp file + atomic rename so fs.watch sees it
+// only when fully written), then poll for the bridge's receipt files.
+func sendSpool(cid, message string, wait bool, timeout time.Duration) (id, status string) {
+	id = fmt.Sprintf("msg-%d", time.Now().UnixNano())
+	p := fmt.Sprintf("%s/%s", inboxDir, id)
+	script := fmt.Sprintf(`umask 0000; cat > '%s.tmp' && mv '%s.tmp' '%s'`, p, p, p)
+	write := exec.Command("docker", "exec", "-i", cid, "sh", "-c", script)
+	write.Stdin = strings.NewReader(message)
+	var stderr bytes.Buffer
+	write.Stderr = &stderr
+	cli.Debug("writing message %s to %s", id, shortCid(cid))
+	if err := write.Run(); err != nil {
+		cli.Fatal("write to bridge inbox: %v (%s)\nhint: the klank bridge extension must be loaded in the agent's pi session (rebuild the image and start a new agent)", err, strings.TrimSpace(stderr.String()))
+	}
+	if wait {
+		return id, waitForReceipt(cid, id, timeout)
+	}
+	return id, "sent"
 }
 
 // waitForReceipt polls the container until the bridge writes the .done (or

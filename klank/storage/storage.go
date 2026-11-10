@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
 	_ "modernc.org/sqlite"
 
@@ -38,6 +37,7 @@ func Open() *sql.DB {
 		image_hash TEXT,
 		tmux_session TEXT,
 		tmux_pane    TEXT,
+		port         INTEGER,
 		created_at INTEGER DEFAULT (unixepoch())
 	)`)
 	if err != nil {
@@ -67,43 +67,44 @@ func migrate(db *sql.DB) {
 		existing[name] = true
 	}
 	rows.Close()
-	for _, col := range []string{"tmux_session", "tmux_pane"} {
-		if existing[col] {
+	for _, col := range []struct{ name, typ string }{
+		{"tmux_session", "TEXT"},
+		{"tmux_pane", "TEXT"},
+		{"port", "INTEGER DEFAULT 0"},
+	} {
+		if existing[col.name] {
 			continue
 		}
-		if _, err := db.Exec(`ALTER TABLE agents ADD COLUMN ` + col + ` TEXT`); err != nil {
-			cli.Fatal("migrate (add %s): %v", col, err)
+		if _, err := db.Exec(`ALTER TABLE agents ADD COLUMN ` + col.name + ` ` + col.typ); err != nil {
+			cli.Fatal("migrate (add %s): %v", col.name, err)
 		}
-		cli.Debug("migrated: added agents.%s", col)
+		cli.Debug("migrated: added agents.%s", col.name)
 	}
 }
 
 // InsertAgent saves a container plus its optional tmux identity and returns
-// the agent's final name (auto-numbered when name is empty).
-func InsertAgent(db *sql.DB, cid, name, image, imageHash, tmuxSession, tmuxPane string) string {
-	// insert with a placeholder name, then set to agent%03d using the seq
-	res, err := db.Exec(`INSERT INTO agents (id, name, image, image_hash, tmux_session, tmux_pane) VALUES (?, ?, ?, ?, ?, ?)`,
-		cid, fmt.Sprintf("__pending%08d", time.Now().UnixNano()), image, imageHash, tmuxSession, tmuxPane)
-	if err != nil {
-		cli.Fatal("save container: %v", err)
-	}
-	seq, err := res.LastInsertId()
-	if err != nil {
-		cli.Fatal("get new seq: %v", err)
-	}
+// the agent's final name (auto-numbered when name is empty). Auto-numbering
+// picks the first free agent%03d name (not max(seq)+1) so renamed agents
+// cannot make the insert fail; the single-statement insert means an
+// interrupted klank can never leave a placeholder-named row behind.
+func InsertAgent(db *sql.DB, cid, name, image, imageHash string, port int, tmuxSession, tmuxPane string) (string, error) {
 	if name == "" {
-		name = fmt.Sprintf("agent%03d", seq)
+		name = NextAgentName(db)
 	}
-	if _, err := db.Exec(`UPDATE agents SET name = ? WHERE seq = ?`, name, seq); err != nil {
-		cli.Fatal("set name: %v", err)
+	if _, err := db.Exec(`INSERT INTO agents (id, name, image, image_hash, port, tmux_session, tmux_pane) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		cid, name, image, imageHash, port, tmuxSession, tmuxPane); err != nil {
+		if strings.Contains(err.Error(), "UNIQUE constraint failed") {
+			return "", fmt.Errorf("agent name %q is already in use", name)
+		}
+		return "", fmt.Errorf("save container: %w", err)
 	}
-	cli.Debug("saved agent %s seq=%d (name=%s image=%s hash=%s tmux=%s/%s)", cid, seq, name, image, imageHash, tmuxSession, tmuxPane)
-	return name
+	cli.Debug("saved agent (name=%s image=%s hash=%s port=%d tmux=%s/%s)", name, image, imageHash, port, tmuxSession, tmuxPane)
+	return name, nil
 }
 
 // ListAgents returns all known agents ordered by seq.
 func ListAgents(db *sql.DB) *cli.QueryResult {
-	rows, err := db.Query(`SELECT seq, id, coalesce(name,'-') as name, image, coalesce(image_hash,'-') as hash, coalesce(tmux_session,'-') as tmux_session, coalesce(tmux_pane,'-') as tmux_pane FROM agents ORDER BY seq`)
+	rows, err := db.Query(`SELECT seq, id, coalesce(name,'-') as name, image, coalesce(image_hash,'-') as hash, coalesce(port,0) as port, coalesce(tmux_session,'-') as tmux_session, coalesce(tmux_pane,'-') as tmux_pane FROM agents ORDER BY seq`)
 	if err != nil {
 		cli.Fatal("query: %v", err)
 	}
@@ -141,6 +142,21 @@ func GetAgentTmux(db *sql.DB, idOrName string) (cid, tmuxSession, tmuxPane strin
 		cli.Fatal("query: %v", err)
 	}
 	return cid, tmuxSession, tmuxPane, true
+}
+
+// GetAgentPort resolves an agent by id or name, returning the container id
+// plus the port of its control server (0 for agents started before klank
+// published ports).
+func GetAgentPort(db *sql.DB, idOrName string) (cid string, port int, ok bool) {
+	err := db.QueryRow(`SELECT id, coalesce(port, 0) FROM agents WHERE name = ? OR id = ?`, idOrName, idOrName).
+		Scan(&cid, &port)
+	if err == sql.ErrNoRows {
+		return "", 0, false
+	}
+	if err != nil {
+		cli.Fatal("query: %v", err)
+	}
+	return cid, port, true
 }
 
 // AgentName resolves an agent by id or name and returns its stored name
@@ -214,14 +230,20 @@ func PruneAgents(db *sql.DB, keep func(cid string) bool) int {
 	return len(remove)
 }
 
-// NextAgentName computes the next default agent name (agent001, ...) from
-// the current max seq; matches the auto-numbering in InsertAgent.
+// NextAgentName returns the first free default agent name (agent001, ...);
+// matches the auto-numbering in InsertAgent and stays correct across
+// renames (a renamed agent's old-style name is not handed out twice).
 func NextAgentName(db *sql.DB) string {
-	var max int
-	if err := db.QueryRow(`SELECT coalesce(max(seq), 0) FROM agents`).Scan(&max); err != nil {
-		cli.Fatal("query: %v", err)
+	for i := 1; ; i++ {
+		name := fmt.Sprintf("agent%03d", i)
+		var taken int
+		if err := db.QueryRow(`SELECT count(*) FROM agents WHERE name = ?`, name).Scan(&taken); err != nil {
+			cli.Fatal("query: %v", err)
+		}
+		if taken == 0 {
+			return name
+		}
 	}
-	return fmt.Sprintf("agent%03d", max+1)
 }
 
 // AllNamesForSelect returns "name\timage" lines for every known agent,

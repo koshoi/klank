@@ -10,13 +10,20 @@ import (
 	"klank/storage"
 )
 
-// List implements `klank list`: silently prune agents whose container is
-// no longer present (e.g. a --rm container that exited), then print all
-// known agents.
-func List(db *sql.DB) {
+// pruneDeadAgents removes database entries whose container is no longer
+// running (e.g. a --rm container that exited), so stale names/sessions
+// become reusable. Docker being broken (dockerUnknown) keeps entries, so a
+// dead daemon never wipes the database.
+func pruneDeadAgents(db *sql.DB) {
 	storage.PruneAgents(db, func(cid string) bool {
 		return dockerAlive(cid) == dockerRunning
 	})
+}
+
+// List implements `klank list`: silently prune dead agents, then print all
+// known agents.
+func List(db *sql.DB) {
+	pruneDeadAgents(db)
 	cli.PrintResult(storage.ListAgents(db))
 }
 

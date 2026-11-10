@@ -21,6 +21,7 @@ func Attach(db *sql.DB, args []string) {
 	if len(args) > 1 {
 		cli.Fatal("usage: klank attach [<id|name>]")
 	}
+	pruneDeadAgents(db)
 	var cid, sessName, pane string
 	if len(args) == 1 {
 		var ok bool

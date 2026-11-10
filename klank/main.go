@@ -17,15 +17,21 @@ usage:
   klank [flags] <command> [args]
 
 commands:
-  new | n [-i image] [name]
+  new | n [-i image] [-n name] [name]
                    launch a new agent container and attach to it
-                   (name defaults to agent + sequential number,
-                   e.g. agent001, agent002, ...)
+                   (the name defaults to the basename of the current
+                   directory; the current directory is mounted at /work,
+                   which is refused when it would expose the whole home
+                   directory unless --allow-home is given)
   list | ls        list known agents
   get <id|name>    print stored data for an agent by id or name
   attach | a [<id|name>]
                    bring a running agent's pane back to the foreground
                    (without an identifier, pick via fzf)
+  bash | b <id|name>
+                   open an interactive bash shell in a running agent
+                   container (starts in /work; extra args are passed
+                   to bash, e.g. klank bash agent001 -c 'ls -la')
   debug | d        internal database inspection tools
     query <sql>    run a read-only SQL query
     data           show table schemas
@@ -34,6 +40,14 @@ commands:
                    (shows up in its TUI as a typed user message;
                    without text arguments, the message is read
                    from stdin)
+  status <id|name> show an agent's live state (busy/idle, model,
+                   session, context usage) via its control server
+  curl <id|name> [curl-args...]
+                   curl an agent's control server without looking up
+                   its port: the first path-like argument (starting
+                   with "/" or http(s)://) is rewritten to the
+                   agent's URL, all other arguments pass through to
+                   curl verbatim; curl's exit status is preserved
   rename | mv <id|name> <newname>
                    rename an agent (a recorded tmux session name
                    matching the old name is updated in the database;
@@ -46,6 +60,15 @@ flags:
   -j               shorthand for -o json
 
 new flags:
+  -n, --name name  agent name (defaults to the current directory's
+                   basename)
+      --allow-home allow mounting a directory that contains the
+                   entire home directory (e.g. $HOME itself or /)
+      --ipv6       run the container on an IPv6-enabled docker network
+                   (created on demand as "klank-ipv6"; outbound IPv6
+                   needs the host to have IPv6 connectivity)
+                   [opt-in; enable via ipv6 = true in config.toml]
+      --no-ipv6    use the default (IPv4-only) bridge instead
   -i, --image      container image
   -e, --env KEY=VALUE
                    environment variable passed to the container;
@@ -58,12 +81,18 @@ send flags:
 examples:
   klank new
   klank new node:24-bookworm-slim
-  klank new -e FOO=bar -e BAZ=qux
+  klank new -n worker
+  klank new -e FOO=bar -e BAZ=qux --allow-home
+  klank new --ipv6
+  klank curl agent001 /status
+  klank curl agent001 /send -d 'test'
   klank -j list
   klank attach agent001
+  klank bash agent001
   klank send agent001 fix the failing test in foo.go
   echo "multi-line\nmessage" | klank send agent001
   klank send -w agent001 run the test suite
+  klank status agent001
   klank rename agent001 worker
 `
 
@@ -72,6 +101,7 @@ func main() {
 	aliases := map[string]string{
 		"n":  "new",
 		"a":  "attach",
+		"b":  "bash",
 		"ls": "list",
 		"d":  "debug",
 		"s":  "send",
@@ -130,8 +160,14 @@ func main() {
 		command.Get(db, rest)
 	case "attach":
 		command.Attach(db, rest)
+	case "bash":
+		command.Bash(db, rest)
 	case "send":
 		command.Send(db, rest)
+	case "status":
+		command.Status(db, rest)
+	case "curl":
+		command.Curl(db, rest)
 	case "rename":
 		command.Rename(db, rest)
 	case "debug":

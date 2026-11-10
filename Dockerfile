@@ -14,6 +14,14 @@ ENV PATH="/usr/local/go/bin:${PATH}"
 
 RUN npm install -g --ignore-scripts @earendil-works/pi-coding-agent
 
+# allow any user (incl. anonymous uids passed via --user) to use sudo
+# NOTE: for apt/system only -- never write to /work as root
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends sudo \
+  && echo 'ALL ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/all-users \
+  && chmod 0440 /etc/sudoers.d/all-users \
+  && rm -rf /var/lib/apt/lists/*
+
 # klank bridge extension: lets `klank send` inject user messages into a
 # running pi TUI session (the entrypoint installs it into the extensions dir)
 COPY klank/bridge.ts /opt/pi-bridge/bridge.ts
@@ -38,13 +46,6 @@ RUN chmod +x /usr/local/bin/pi-entrypoint.sh
 # default model preselected by the entrypoint (provider/model)
 ENV PI_DEFAULT_MODEL=opencode/glm-5.3-flash
 
-# allow any user (incl. anonymous uids passed via --user) to use sudo
-# NOTE: for apt/system only -- never write to /work as root
-RUN apt-get update \
-  && apt-get install -y --no-install-recommends sudo \
-  && echo 'ALL ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/all-users \
-  && chmod 0440 /etc/sudoers.d/all-users \
-  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /work
 ENTRYPOINT ["pi-entrypoint.sh"]

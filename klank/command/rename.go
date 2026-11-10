@@ -21,6 +21,7 @@ func Rename(db *sql.DB, args []string) {
 	if newName == "" || strings.ContainsAny(newName, " \t\n") {
 		cli.Fatal("invalid name %q (must be non-empty and contain no whitespace)", newName)
 	}
+	pruneDeadAgents(db)
 
 	oldName := storage.AgentName(db, idOrName)
 	if oldName == "" {
