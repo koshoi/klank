@@ -22,6 +22,11 @@ COPY klank/bridge.ts /opt/pi-bridge/bridge.ts
 # bash intent interceptor) — installed into the extensions dir by the entrypoint
 COPY extensions/edit-guard.ts /opt/pi-bridge/edit-guard.ts
 
+# subagents extension: task delegation to isolated `pi` subprocesses
+# (single/parallel/chain modes, agents defined as markdown frontmatter) —
+# installed into the extensions dir by the entrypoint
+COPY extensions/subagents /opt/pi-bridge/subagents/
+
 # entrypoint: auto-login to opencode from env + preselect default model
 COPY pi-entrypoint.sh /usr/local/bin/pi-entrypoint.sh
 RUN chmod +x /usr/local/bin/pi-entrypoint.sh

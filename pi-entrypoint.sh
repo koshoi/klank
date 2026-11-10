@@ -56,6 +56,16 @@ if [[ -f "$GUARD_SRC" ]]; then
   echo "[pi-entrypoint] edit-guard extension installed"
 fi
 
+# --- install the subagents extension (task delegation to child pi processes) ---
+SUB_SRC=/opt/pi-bridge/subagents
+if [[ -d "$SUB_SRC" ]]; then
+  mkdir -p "$PI_DIR/extensions/subagents" "$PI_DIR/agents" "$PI_DIR/prompts"
+  cp -f "$SUB_SRC/index.ts" "$SUB_SRC/agents.ts" "$PI_DIR/extensions/subagents/"
+  cp -f "$SUB_SRC"/agents/*.md "$PI_DIR/agents/"
+  cp -f "$SUB_SRC"/prompts/*.md "$PI_DIR/prompts/"
+  echo "[pi-entrypoint] subagents extension installed"
+fi
+
 # --- preselect default model in settings.json (merge if it exists) ---
 provider="${DEFAULT_MODEL%%/*}"
 model="${DEFAULT_MODEL#*/}"

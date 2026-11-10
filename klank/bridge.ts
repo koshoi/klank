@@ -20,6 +20,13 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 const INBOX = "/tmp/pi-inbox";
 
 export default function (pi: ExtensionAPI) {
+	// subagent extension spawns child `pi` processes which load this extension
+	// too; only the top-level session may consume the inbox, otherwise N
+	// watchers race to inject the same message
+	if (process.env.KLANK_SUBAGENT === "1") {
+		console.error("[klank-bridge] subagent process; inbox watching disabled");
+		return;
+	}
 	let watcher: fs.FSWatcher | null = null;
 	let busy = false; // tracked via agent_start / agent_settled
 	const inFlight = new Set<string>(); // message ids awaiting agent settle

@@ -42,8 +42,9 @@ should survive lives in `/work` (your project directory).
 - Base: `node:24-bookworm-slim`; installs `pi` globally via npm.
 - Adds bash, ca-certificates, git, ripgrep, curl, jq, fzf and a current Go
   toolchain, so agents can build/run Go projects out of the box.
-- Copies `klank/bridge.ts` and `extensions/edit-guard.ts` into
-  `/opt/pi-bridge/` for the entrypoint to install.
+- Copies `klank/bridge.ts`, `extensions/edit-guard.ts` and
+  `extensions/subagents/` into `/opt/pi-bridge/` for the entrypoint to
+  install.
 - Grants passwordless `sudo` to any user (for apt/system work inside the
   container — the agent should still never write to `/work` as root).
 - No `CMD`: the entrypoint must run `pi` with no arguments (a CMD argument
@@ -55,8 +56,10 @@ The container entrypoint:
 
 1. Reads `OPENCODE_API_KEY` (or falls back to `OPENAI_API_KEY`) from the
    environment and writes it into the pi `auth.json` (opencode login).
-2. Installs both pi extensions (`bridge.ts`, `edit-guard.ts`) into the pi
-   extensions directory.
+2. Installs the pi extensions (`bridge.ts`, `edit-guard.ts`,
+   `subagents/`) into the pi extensions directory, agent definitions into
+   `~/.pi/agent/agents/` and workflow prompt templates into
+   `~/.pi/agent/prompts/`.
 3. Preselects the default model from `PI_DEFAULT_MODEL`
    (default: `opencode/glm-5.3-flash`) in `settings.json`.
 4. `exec`s `pi`.
@@ -75,6 +78,14 @@ The container entrypoint:
   intercepts edit-shaped shell commands (`sed -i`, redirects, …) and points
   the model at the edit tools instead. Block reasons always explain how to
   recover (re-read), so a blocked call costs one retry, not a dead end.
+- **`extensions/subagents/`** — subagent task delegation: registers the
+  `subagent` tool, which spawns child `pi` processes (single, parallel
+  batch, or sequential chain modes) with isolated context windows. Agents
+  are markdown files with frontmatter (`name`, `description`, `tools`,
+  `model`) in `~/.pi/agent/agents/`; bundled ones: `scout`, `planner`,
+  `reviewer`, `worker`. Children run with `KLANK_SUBAGENT=1`, which tells
+  the bridge not to watch the inbox (only the top-level session consumes
+  `klank send` messages). See `extensions/subagents/README.md`.
 
 Receipts written by the bridge, next to the message file:
 
@@ -236,7 +247,8 @@ Repository layout:
   extension, copied into the image).
 - `Dockerfile` — the agent image.
 - `pi-entrypoint.sh` — container entrypoint.
-- `extensions/` — pi extensions baked into the image (`edit-guard.ts`).
+- `extensions/` — pi extensions baked into the image (`edit-guard.ts`,
+  `subagents/`).
 
 Notes for AI sessions working on klank:
 
