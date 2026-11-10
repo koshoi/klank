@@ -48,6 +48,14 @@ if [[ -f "$BRIDGE_SRC" ]]; then
   echo "[pi-entrypoint] klank bridge extension installed"
 fi
 
+# --- install the edit-guard extension (snapshot edit guardrails) ---
+GUARD_SRC=/opt/pi-bridge/edit-guard.ts
+if [[ -f "$GUARD_SRC" ]]; then
+  mkdir -p "$PI_DIR/extensions"
+  cp -f "$GUARD_SRC" "$PI_DIR/extensions/edit-guard.ts"
+  echo "[pi-entrypoint] edit-guard extension installed"
+fi
+
 # --- preselect default model in settings.json (merge if it exists) ---
 provider="${DEFAULT_MODEL%%/*}"
 model="${DEFAULT_MODEL#*/}"

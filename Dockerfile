@@ -18,6 +18,10 @@ RUN npm install -g --ignore-scripts @earendil-works/pi-coding-agent
 # running pi TUI session (the entrypoint installs it into the extensions dir)
 COPY klank/bridge.ts /opt/pi-bridge/bridge.ts
 
+# edit-guard extension: snapshot-based edit guardrails (staleness detection,
+# bash intent interceptor) — installed into the extensions dir by the entrypoint
+COPY extensions/edit-guard.ts /opt/pi-bridge/edit-guard.ts
+
 # entrypoint: auto-login to opencode from env + preselect default model
 COPY pi-entrypoint.sh /usr/local/bin/pi-entrypoint.sh
 RUN chmod +x /usr/local/bin/pi-entrypoint.sh
