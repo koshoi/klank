@@ -9,6 +9,13 @@
 //                            since the last read (hash mismatch), which catches
 //                            out-of-band mutations (bash, eval, manual edits)
 //                            before they corrupt the model's mental model.
+//                            When the staleness is locally explainable, the
+//                            block message includes a partial-staleness
+//                            reveal (a line diff of the changed regions,
+//                            like omp's stale-tag reveal) and refreshes the
+//                            snapshot, so the model can fix up its edit from
+//                            the message alone instead of re-reading the
+//                            whole file.
 //   3. Bash interceptor    - edit-shaped shell commands (sed -i, perl -i,
 //                            awk inplace, echo/printf redirects) are blocked
 //                            with a message pointing at the edit/write tools.
@@ -16,7 +23,8 @@
 //                            tool discipline for the cases regex cannot catch.
 //
 // No configuration required. Block reasons always tell the model exactly how
-// to recover (re-read), so a blocked call costs one retry, not a dead end.
+// to recover (use the shown diff, or re-read), so a blocked call costs one
+// retry, not a dead end.
 
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
@@ -25,8 +33,13 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 // --- snapshot store ---------------------------------------------------------
 
+// Content is kept so a staleness block can show a diff; very large files
+// store hash only (reveal is not worth holding megabytes per file).
+const CONTENT_CAP = 512 * 1024;
+
 interface Snapshot {
 	hash: string; // short content fingerprint of the file as last seen
+	text?: string; // content as last seen (omitted when too large)
 }
 
 const snapshots = new Map<string, Snapshot>(); // key: canonical path
@@ -42,13 +55,13 @@ const canonical = (p: string): string => {
 	}
 };
 
-/** Hash the file as it is on disk right now; null for unreadable/binary. */
+/** Snapshot the file as it is on disk right now; null for unreadable/binary. */
 const currentSnapshot = (p: string): Snapshot | null => {
 	try {
 		const st = fs.statSync(p);
 		if (!st.isFile()) return null;
 		const text = fs.readFileSync(p, "utf8");
-		return { hash: hashText(text) };
+		return { hash: hashText(text), text: text.length <= CONTENT_CAP ? text : undefined };
 	} catch {
 		return null; // binary (utf8 replacement chars are fine) or vanished
 	}
@@ -57,6 +70,112 @@ const currentSnapshot = (p: string): Snapshot | null => {
 const remember = (p: string) => {
 	const snap = currentSnapshot(p);
 	if (snap) snapshots.set(canonical(p), snap);
+};
+
+// --- line diff (LCS) ---------------------------------------------------------
+
+interface Hunk {
+	oldStart: number; // 1-based line number in the file as last seen
+	newStart: number; // 1-based line number in the file as it is now
+	lines: string[]; // rendered "- old" / "+ new" rows
+}
+
+const MAX_DIFF_CELLS = 2_000_000; // LCS table budget (oldTail * newTail)
+const MAX_REVEAL_LINES = 80; // rendered diff rows per block message
+
+/** Unified-style hunk headers: @@ -a,b +c,d @@ (ranges elided when length 1). */
+const hunkHeader = (h: Hunk): string => {
+	const oldLen = h.lines.filter((l) => l.startsWith("-")).length;
+	const newLen = h.lines.filter((l) => l.startsWith("+")).length;
+	const range = (n: number, len: number) => (len === 1 ? `${n}` : `${n},${len}`);
+	return `@@ -${range(h.oldStart, oldLen)} +${range(h.newStart, newLen)} @@`;
+};
+
+/**
+ * Line-level diff of two texts, grouped into changed hunks. Returns null when
+ * the change is too large to align within budget — the caller then falls back
+ * to the plain re-read message instead of a misleading partial reveal.
+ */
+const diffHunks = (oldText: string, newText: string): Hunk[] | null => {
+	const a = oldText.split("\n");
+	const b = newText.split("\n");
+
+	// trim common prefix/suffix so the LCS only covers the changed core
+	let start = 0;
+	while (start < a.length && start < b.length && a[start] === b[start]) start++;
+	let endA = a.length;
+	let endB = b.length;
+	while (endA > start && endB > start && a[endA - 1] === b[endB - 1]) {
+		endA--;
+		endB--;
+	}
+	const oldTail = a.slice(start, endA);
+	const newTail = b.slice(start, endB);
+	if (oldTail.length === 0 && newTail.length === 0) return []; // hash said otherwise (CRLF?) — no reveal
+	if (oldTail.length * newTail.length > MAX_DIFF_CELLS) return null;
+
+	// LCS table over the changed core
+	const n = oldTail.length;
+	const m = newTail.length;
+	const table = new Int32Array((n + 1) * (m + 1));
+	const at = (i: number, j: number) => i * (m + 1) + j;
+	for (let i = n - 1; i >= 0; i--) {
+		for (let j = m - 1; j >= 0; j--) {
+			table[at(i, j)] =
+				oldTail[i] === newTail[j]
+					? table[at(i + 1, j + 1)] + 1
+					: Math.max(table[at(i + 1, j)], table[at(i, j + 1)]);
+		}
+	}
+
+	// walk the table, grouping del/ins runs into hunks
+	const hunks: Hunk[] = [];
+	let i = 0;
+	let j = 0;
+	let current: Hunk | null = null;
+	const push = (row: string) => {
+		if (!current) {
+			current = {
+				oldStart: start + i + 1,
+				newStart: start + j + 1,
+				lines: [],
+			};
+			hunks.push(current);
+		}
+		current.lines.push(row);
+	};
+	const close = () => {
+		current = null;
+	};
+	while (i < n && j < m) {
+		if (oldTail[i] === newTail[j]) {
+			close();
+			i++;
+			j++;
+		} else if (table[at(i + 1, j)] >= table[at(i, j + 1)]) {
+			push(`- ${oldTail[i]}`);
+			i++;
+		} else {
+			push(`+ ${newTail[j]}`);
+			j++;
+		}
+	}
+	while (i < n) push(`- ${oldTail[i++]}`);
+	close();
+	while (j < m) push(`+ ${newTail[j++]}`);
+	close();
+	return hunks;
+};
+
+/** Render hunks into the reveal block; null when it would exceed the cap. */
+const renderReveal = (hunks: Hunk[]): string | null => {
+	const out: string[] = [];
+	for (const h of hunks) {
+		const header = hunkHeader(h);
+		if (out.length + h.lines.length + 1 > MAX_REVEAL_LINES) return null;
+		out.push(header, ...h.lines);
+	}
+	return out.join("\n");
 };
 
 // --- bash intent interceptor ------------------------------------------------
@@ -123,7 +242,8 @@ export default function (pi: ExtensionAPI) {
 	const promptRule =
 		"<critical>NEVER use `sed`|`perl`|`python` via bash to issue individual edits; " +
 		"use the `edit` tool. Files must be `read` before `edit`/`write`; if a guard " +
-		"message says the file changed, re-read it first.</critical>";
+		"message says the file changed, use the shown region diff to fix up your " +
+		"change and retry — re-read (offset/limit) only when you need more context.</critical>";
 
 	// Layer 4: tool-discipline rule in the system prompt
 	pi.on("before_agent_start", async (event) => {
@@ -174,11 +294,33 @@ export default function (pi: ExtensionAPI) {
 			if (!now) return;
 
 			if (seen && seen.hash !== now.hash) {
+				// Partial-staleness reveal: when we still have what the model saw
+				// and the change is small enough to align, show the changed
+				// regions (with current line numbers) and refresh the snapshot so
+				// the model can retry immediately — no full re-read needed.
+				const reveal =
+					seen.text !== undefined && now.text !== undefined
+						? renderReveal(diffHunks(seen.text, now.text) ?? [])
+						: null;
+				if (reveal) {
+					snapshots.set(key, now); // revealed state is now the model's baseline
+					return {
+						block: true,
+						reason:
+							`File changed since you last read it (snapshot ${seen.hash}, on disk ${now.hash}). ` +
+							"Something (bash, eval, another process) modified it out-of-band. " +
+							"Changed regions (old line numbers → current):\n\n" +
+							reveal +
+							"\n\n" +
+							"edit-guard: snapshot refreshed — apply your change against the current content shown above and retry. " +
+							"Use `read` with offset/limit for a specific region only if you need more context.",
+					};
+				}
 				return {
 					block: true,
 					reason:
 						`File changed since you last read it (snapshot ${seen.hash}, on disk ${now.hash}). ` +
-						"Something (bash, eval, another process) modified it out-of-band. " +
+						"Something (bash, eval, another process) modified it out-of-band, and the change is too large to summarize. " +
 						"Re-read the file and re-apply your change against the current content.",
 				};
 			}
@@ -192,9 +334,11 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("edit-guard", {
 		description: "Show edit-guard snapshot stats",
 		handler: async (_args, ctx) => {
-			const files = [...snapshots.keys()].map((k) => k.replace(ctx.cwd, "."));
+			const entries = [...snapshots.entries()];
+			const withText = entries.filter(([, s]) => s.text !== undefined).length;
+			const list = entries.map(([k]) => k.replace(ctx.cwd, ".")).join("\n");
 			ctx.ui.notify(
-				`edit-guard: ${files.length} tracked snapshot(s)\n${files.join("\n")}`,
+				`edit-guard: ${entries.length} tracked snapshot(s) (${withText} with reveal content)\n${list}`,
 				"info",
 			);
 		},

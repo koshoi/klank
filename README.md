@@ -86,8 +86,13 @@ The container entrypoint:
   content hash of every file the model has read and blocks `edit`/`write`
   calls against files that changed since (catching out-of-band mutations),
   intercepts edit-shaped shell commands (`sed -i`, redirects, …) and points
-  the model at the edit tools instead. Block reasons always explain how to
-  recover (re-read), so a blocked call costs one retry, not a dead end.
+  the model at the edit tools instead. When a staleness block is locally
+  explainable, the message includes a partial-staleness reveal — a line
+  diff of the changed regions (idea borrowed from omp's stale-tag reveal) —
+  and refreshes the snapshot, so the model can fix its edit from the block
+  message alone. Block reasons always explain how to recover (use the shown
+  diff, or re-read for large changes), so a blocked call costs one retry,
+  not a dead end.
 - **`extensions/subagents/`** — subagent task delegation: registers the
   `subagent` tool, which spawns child `pi` processes (single, parallel
   batch, or sequential chain modes) with isolated context windows. Agents
