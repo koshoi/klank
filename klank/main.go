@@ -17,7 +17,7 @@ usage:
   klank [flags] <command> [args]
 
 commands:
-  new | n [-n name] [image]
+  new | n [-i image] [name]
                    launch a new agent container and attach to it
                    (name defaults to agent + sequential number,
                    e.g. agent001, agent002, ...)
@@ -34,6 +34,10 @@ commands:
                    (shows up in its TUI as a typed user message;
                    without text arguments, the message is read
                    from stdin)
+  rename | mv <id|name> <newname>
+                   rename an agent (a recorded tmux session name
+                   matching the old name is updated in the database;
+                   the tmux session itself is left untouched)
 
 flags:
   -h               show help
@@ -42,7 +46,7 @@ flags:
   -j               shorthand for -o json
 
 new flags:
-  -n, --name       agent name
+  -i, --image      container image
   -e, --env KEY=VALUE
                    environment variable passed to the container;
                    repeatable
@@ -60,6 +64,7 @@ examples:
   klank send agent001 fix the failing test in foo.go
   echo "multi-line\nmessage" | klank send agent001
   klank send -w agent001 run the test suite
+  klank rename agent001 worker
 `
 
 func main() {
@@ -70,6 +75,7 @@ func main() {
 		"ls": "list",
 		"d":  "debug",
 		"s":  "send",
+		"mv": "rename",
 	}
 	var args []string
 	argv := os.Args[1:]
@@ -126,6 +132,8 @@ func main() {
 		command.Attach(db, rest)
 	case "send":
 		command.Send(db, rest)
+	case "rename":
+		command.Rename(db, rest)
 	case "debug":
 		command.Debug(db, rest)
 	case "help":

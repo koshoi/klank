@@ -1,25 +1,97 @@
 # klank
 
-`klank` is a CLI for running isolated AI coding-agent sessions in Docker
+`klank` is a tool for running isolated AI coding-agent sessions in Docker
 containers on your local machine. Each agent (e.g. a `pi` coding session)
 runs inside its own container, so the agent can install packages, run
 arbitrary commands and generally make a mess — without touching your host
 system. Only the directory you launch from is shared with the container.
 
-## How it works
+The project has three parts that work together:
 
-`klank new`:
+| Part              | Where                | What it does                                                |
+|-------------------|----------------------|-------------------------------------------------------------|
+| **klank CLI**     | `klank/` (Go)        | Launches, tracks and communicates with agent containers      |
+| **Agent image**   | `Dockerfile` + `pi-entrypoint.sh` | The container image the agents run in               |
+| **pi extensions** | `extensions/`, `klank/bridge.ts`  | In-container behavior baked into the image           |
 
-1. runs `docker run -d --rm -it` with:
+## How the pieces fit together
+
+1. **Build the image** — the `Dockerfile` builds `klank:latest` on top of
+   `node:24-bookworm-slim`: the [`pi`
+   coding agent](https://www.npmjs.com/package/@earendil-works/pi-coding-agent)
+   plus a toolbelt (bash, git, ripgrep, curl, jq, fzf, Go toolchain, sudo),
+   the two pi extensions, and the entrypoint script.
+2. **Launch an agent** — `klank new` runs `docker run -d --rm -it` with:
    - `--user <uid>:<gid>` matching your local user, so files created in the
      shared directory keep your ownership;
-   - the current working directory bind-mounted at `/work`.
-2. saves the container (id, name, image, image hash, tmux pane) in a local
-   sqlite database (`~/.klank/klank.db`);
-3. attaches your terminal to the container (its entrypoint is the AI agent).
+   - the current working directory bind-mounted at `/work`;
+   - `-e` environment variables / an env file (typically API keys from the
+     project `.env`).
+3. **Enter the session** — the container's entrypoint logs the agent in to
+   its model provider, installs the extensions, preselects the default
+   model, and `exec`s `pi`. Your terminal is attached to the container,
+   inside a tmux pane that klank remembers.
 
 The container is `--rm`: it disappears when the session ends; anything that
 should survive lives in `/work` (your project directory).
+
+## Agent image details
+
+### `Dockerfile`
+
+- Base: `node:24-bookworm-slim`; installs `pi` globally via npm.
+- Adds bash, ca-certificates, git, ripgrep, curl, jq, fzf and a current Go
+  toolchain, so agents can build/run Go projects out of the box.
+- Copies `klank/bridge.ts` and `extensions/edit-guard.ts` into
+  `/opt/pi-bridge/` for the entrypoint to install.
+- Grants passwordless `sudo` to any user (for apt/system work inside the
+  container — the agent should still never write to `/work` as root).
+- No `CMD`: the entrypoint must run `pi` with no arguments (a CMD argument
+  would be forwarded as an initial prompt).
+
+### `pi-entrypoint.sh`
+
+The container entrypoint:
+
+1. Reads `OPENCODE_API_KEY` (or falls back to `OPENAI_API_KEY`) from the
+   environment and writes it into the pi `auth.json` (opencode login).
+2. Installs both pi extensions (`bridge.ts`, `edit-guard.ts`) into the pi
+   extensions directory.
+3. Preselects the default model from `PI_DEFAULT_MODEL`
+   (default: `opencode/glm-5.3-flash`) in `settings.json`.
+4. `exec`s `pi`.
+
+### pi extensions
+
+- **`klank/bridge.ts`** — the bridge for external messages: watches
+  `/tmp/pi-inbox` inside the container; any `msg-<id>` file dropped there is
+  removed and injected into the running pi session as if typed by the user,
+  so it shows up in the TUI transcript like any other message. If the agent
+  is mid-run, the message is queued as a steering message. This is what
+  powers `klank send` (see below).
+- **`extensions/edit-guard.ts`** — snapshot-based edit guardrails: tracks a
+  content hash of every file the model has read and blocks `edit`/`write`
+  calls against files that changed since (catching out-of-band mutations),
+  intercepts edit-shaped shell commands (`sed -i`, redirects, …) and points
+  the model at the edit tools instead. Block reasons always explain how to
+  recover (re-read), so a blocked call costs one retry, not a dead end.
+
+Receipts written by the bridge, next to the message file:
+
+- `msg-<id>.sent` — delivered to the agent (content: `started` or `queued`)
+- `msg-<id>.done` — agent settled after the message
+- `msg-<id>.error` — delivery failed
+
+Agents started from older images without the bridge reject `send` with a
+write error — rebuild the image and start a new agent.
+
+## The klank CLI
+
+### How it works
+
+`klank new` saves the container (id, name, image, image hash, tmux pane) in
+a local sqlite database (`~/.klank/klank.db`) and attaches your terminal to
+the container.
 
 ### tmux integration
 
@@ -47,10 +119,10 @@ address because it stays valid when the pane is moved between windows.
 Agents recorded before tmux integration (no pane saved) fall back to plain
 `docker attach`.
 
-## Commands
+### Commands
 
 ```
-klank new [-n name] [-e KEY=VALUE ...] [image]
+klank new [-i image] [-e KEY=VALUE ...] [name]
                   launch a new agent container and attach to it
 klank list        list known agents
                   (agents whose container is no longer present are pruned
@@ -61,6 +133,10 @@ klank get <id|name>
 klank attach [<id|name>]
                   bring an agent's pane back to the foreground
                   (without an argument: pick via fzf)
+klank rename <id|name> <newname>
+                  rename an agent (a recorded tmux session name matching
+                  the old name is updated in the database; the tmux
+                  session itself is left untouched)
 klank send [-w] [--timeout s] <id|name> <text...>
                   send a message to a running agent's pi session
                   (without text arguments, the message is read from
@@ -75,10 +151,14 @@ for `list`, `get`, `debug`), `-h` (help).
 
 `new` flags:
 
-- `-n, --name <name>` — agent name; when started outside tmux this is also
-  the tmux session name. Defaults to `agent001`, `agent002`, ...
+- `-i, --image <image>` — container image. Defaults to the configured
+  default image.
 - `-e, --env KEY=VALUE` — environment variable for the container
   (repeatable; overrides the configured env file).
+
+`new` also takes the agent name as a positional argument (`klank new
+myagent`); when started outside tmux it is also the tmux session name.
+Defaults to `agent001`, `agent002`, ...
 
 `send` flags:
 
@@ -94,26 +174,7 @@ echo "multi-line\nmessage" | klank send agent001
 klank send -w agent001 run the test suite
 ```
 
-### Bridge extension (external messages)
-
-The image ships the `bridge` pi extension (`klank/bridge.ts`, installed
-into the extensions dir by the entrypoint). It watches `/tmp/pi-inbox`
-inside the container: any `msg-<id>` file dropped there is removed and
-injected into the running pi session as if typed by the user, so it shows
-up in the TUI transcript like any other message. If the agent is mid-run,
-the message is queued as a steering message.
-
-Receipts are written next to the message file:
-
-- `msg-<id>.sent` — delivered to the agent (content: `started` or `queued`)
-- `msg-<id>.done` — agent settled after the message
-- `msg-<id>.error` — delivery failed
-
-`klank send` uses this to deliver messages and (with `--wait`) polls for
-the `.done` receipt. Agents started from older images without the bridge
-reject `send` with a write error — rebuild the image and start a new agent.
-
-## Configuration
+### Configuration
 
 Config files are TOML, merged lowest to highest priority:
 
@@ -131,7 +192,7 @@ Keys:
   container (comments, blank lines and `export ` prefixes are supported;
   `-e` flags override it)
 
-## Database
+### Database
 
 `~/.klank/klank.db` (sqlite), table `agents`:
 
@@ -160,17 +221,25 @@ Inspect it with `klank debug query "SELECT ..."` / `klank debug data`.
 ## Development
 
 ```sh
+docker build -t klank:latest .   # build the agent image
 cd klank
-go build          # produces ./klank
+go build                         # produces ./klank
 go vet
 ```
 
-Notes for AI sessions working on klank:
+Repository layout:
 
-- Package layout: `main.go` (usage, flags, dispatch), `cli/` (debug/error
+- `klank/` — the CLI. `main.go` (usage, flags, dispatch), `cli/` (debug/error
   output, text/json printing), `config/` (TOML config + env files),
   `storage/` (sqlite database), `command/` (one file per command plus
-  shared `docker.go`/`tmux.go` helpers).
+  shared `docker.go`/`tmux.go` helpers), `bridge.ts` (the pi bridge
+  extension, copied into the image).
+- `Dockerfile` — the agent image.
+- `pi-entrypoint.sh` — container entrypoint.
+- `extensions/` — pi extensions baked into the image (`edit-guard.ts`).
+
+Notes for AI sessions working on klank:
+
 - `docker` and `tmux` are shelled out to via `os/exec`, so logic can be
   tested with stub executables on `PATH` (a fake `docker` script) plus a
   real `tmux`.

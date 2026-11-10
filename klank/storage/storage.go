@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -140,6 +141,40 @@ func GetAgentTmux(db *sql.DB, idOrName string) (cid, tmuxSession, tmuxPane strin
 		cli.Fatal("query: %v", err)
 	}
 	return cid, tmuxSession, tmuxPane, true
+}
+
+// AgentName resolves an agent by id or name and returns its stored name
+// (empty string when no such agent exists).
+func AgentName(db *sql.DB, idOrName string) string {
+	var name string
+	err := db.QueryRow(`SELECT name FROM agents WHERE name = ? OR id = ?`, idOrName, idOrName).Scan(&name)
+	if err == sql.ErrNoRows {
+		return ""
+	}
+	if err != nil {
+		cli.Fatal("query: %v", err)
+	}
+	return name
+}
+
+// RenameAgent changes an agent's name (addressed by its container id) and,
+// when newTmuxSession is non-empty, the tmux session recorded for it (used
+// when the agent owns a session named after it). Fails with a friendly
+// message when the new name is already taken.
+func RenameAgent(db *sql.DB, idOrName, newName, cid, newTmuxSession string) {
+	var err error
+	if newTmuxSession != "" {
+		_, err = db.Exec(`UPDATE agents SET name = ?, tmux_session = ? WHERE id = ?`, newName, newTmuxSession, cid)
+	} else {
+		_, err = db.Exec(`UPDATE agents SET name = ? WHERE id = ?`, newName, cid)
+	}
+	if err != nil {
+		if strings.Contains(err.Error(), "UNIQUE constraint failed") {
+			cli.Fatal("cannot rename to %s: name already in use", newName)
+		}
+		cli.Fatal("rename agent: %v", err)
+	}
+	cli.Debug("renamed agent %s to %s (tmux_session=%q)", idOrName, newName, newTmuxSession)
 }
 
 // UpdateAgentTmux backfills the tmux identity of an already saved agent.

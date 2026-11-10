@@ -36,16 +36,16 @@ func appendEnvPair(pairs []string, pair string) []string {
 // otherwise).
 func New(db *sql.DB, cfg *config.Config, args []string) {
 	name := ""
-	var imageName string
+	imageName := ""
 	envPairs := []string{} // ordered, dedup'd on later -e occurrences
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		switch a {
-		case "-n", "--name":
+		case "-i", "--image":
 			if i+1 >= len(args) {
 				cli.Fatal("%s requires a value", a)
 			}
-			name = args[i+1]
+			imageName = args[i+1]
 			i++
 		case "-e", "--env":
 			if i+1 >= len(args) {
@@ -54,10 +54,10 @@ func New(db *sql.DB, cfg *config.Config, args []string) {
 			envPairs = appendEnvPair(envPairs, args[i+1])
 			i++
 		default:
-			if imageName != "" {
+			if name != "" {
 				cli.Fatal("unexpected argument: %s", a)
 			}
-			imageName = a
+			name = a
 		}
 	}
 	image := imageName
