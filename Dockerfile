@@ -27,6 +27,10 @@ COPY extensions/edit-guard.ts /opt/pi-bridge/edit-guard.ts
 # installed into the extensions dir by the entrypoint
 COPY extensions/subagents /opt/pi-bridge/subagents/
 
+# user-borders extension: ASCII rules around user messages (keeps prompts
+# visually distinct from model output on color-poor terminals)
+COPY extensions/user-borders.ts /opt/pi-bridge/user-borders.ts
+
 # entrypoint: auto-login to opencode from env + preselect default model
 COPY pi-entrypoint.sh /usr/local/bin/pi-entrypoint.sh
 RUN chmod +x /usr/local/bin/pi-entrypoint.sh

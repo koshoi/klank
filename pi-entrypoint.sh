@@ -66,6 +66,13 @@ if [[ -d "$SUB_SRC" ]]; then
   echo "[pi-entrypoint] subagents extension installed"
 fi
 
+# --- install the user-borders extension (ASCII rules around user messages) ---
+BORDERS_SRC=/opt/pi-bridge/user-borders.ts
+if [[ -f "$BORDERS_SRC" ]]; then
+  cp -f "$BORDERS_SRC" "$PI_DIR/extensions/user-borders.ts"
+  echo "[pi-entrypoint] user-borders extension installed"
+fi
+
 # --- preselect default model in settings.json (merge if it exists) ---
 provider="${DEFAULT_MODEL%%/*}"
 model="${DEFAULT_MODEL#*/}"
