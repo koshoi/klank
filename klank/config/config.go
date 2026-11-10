@@ -1,0 +1,118 @@
+// Package config loads klank's TOML configuration.
+//
+// Config is loaded with the standard software config priority hierarchy
+// (lowest to highest; later sources override earlier ones):
+//
+//  1. built-in defaults
+//  2. system config:  /etc/klank/config.toml
+//  3. user config:    $XDG_CONFIG_HOME/klank/config.toml
+//     (default ~/.config/klank/config.toml)
+//  4. project config: ./.klank.toml (current working directory)
+//  5. environment:    KLANK_IMAGE
+//  6. CLI arguments
+package config
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/BurntSushi/toml"
+
+	"klank/cli"
+)
+
+// Config holds the configurable klank settings.
+type Config struct {
+	Image   string `toml:"image"`    // default container image for "klank new"
+	EnvFile string `toml:"env_file"` // path to a default env file passed to the container
+}
+
+// DefaultImage is the built-in default container image.
+const DefaultImage = "klank:latest"
+
+// userConfigPath returns the user-level config file path.
+func userConfigPath() string {
+	if xdg := os.Getenv("XDG_CONFIG_HOME"); xdg != "" {
+		return filepath.Join(xdg, "klank", "config.toml")
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		cli.Debug("cannot determine home dir: %v", err)
+		return ""
+	}
+	return filepath.Join(home, ".config", "klank", "config.toml")
+}
+
+// loadConfigFile reads a single TOML file into cfg, ignoring missing files.
+func loadConfigFile(path, desc string, cfg *Config) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			cli.Debug("read %s config %s: %v", desc, path, err)
+		}
+		return
+	}
+	if err := toml.Unmarshal(data, cfg); err != nil {
+		cli.Fatal("invalid %s config %s: %v", desc, path, err)
+	}
+	cli.Debug("loaded %s config: %s", desc, path)
+}
+
+// Load assembles the effective config according to the hierarchy above.
+func Load() *Config {
+	cfg := &Config{Image: DefaultImage}
+	for _, path := range []string{
+		"/etc/klank/config.toml", // system
+		userConfigPath(),         // user
+		".klank.toml",            // project
+	} {
+		if path == "" {
+			continue
+		}
+		loadConfigFile(path, "config", cfg)
+	}
+	// environment overrides file configs
+	if v := os.Getenv("KLANK_IMAGE"); v != "" {
+		cfg.Image = v
+	}
+	return cfg
+}
+
+// ParseEnvFile reads a dotenv-style file (KEY=VALUE per line, supports
+// "export " prefix, # comments, blank lines) into a map.
+func ParseEnvFile(path string) map[string]string {
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(cli.MustCwd(), path)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			cli.Fatal("env file not found: %s", path)
+		}
+		cli.Fatal("read env file %s: %v", path, err)
+	}
+	env := map[string]string{}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		line = strings.TrimPrefix(line, "export ")
+		line = strings.TrimSpace(line)
+		k, v, ok := strings.Cut(line, "=")
+		if !ok || strings.TrimSpace(k) == "" {
+			cli.Fatal("invalid line in env file %s: %q", path, line)
+		}
+		env[strings.TrimSpace(k)] = unquoteEnvValue(strings.TrimSpace(v))
+	}
+	return env
+}
+
+// unquoteEnvValue strips surrounding single/double quotes if present.
+func unquoteEnvValue(v string) string {
+	if len(v) >= 2 && (v[0] == v[len(v)-1]) && (v[0] == '"' || v[0] == '\'') {
+		return v[1 : len(v)-1]
+	}
+	return v
+}

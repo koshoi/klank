@@ -1,0 +1,12 @@
+# secrets: API keys, tokens
+.env
+
+# built binary
+klank/klank
+
+# go test/tooling artifacts
+*.test
+*.out
+
+# node
+node_modules/
