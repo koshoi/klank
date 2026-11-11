@@ -49,10 +49,18 @@ if [[ -f "$BRIDGE_SRC" ]]; then
 fi
 
 # --- install the edit-guard extension (snapshot edit guardrails) ---
+# Also installs hashline.ts (shared fingerprint/formatting primitives) and
+# hashline-read.ts (read override that emits [path#TAG] + N:-numbered lines);
+# edit-guard.ts imports ./hashline.ts, so all three must live side by side.
 GUARD_SRC=/opt/pi-bridge/edit-guard.ts
 if [[ -f "$GUARD_SRC" ]]; then
   mkdir -p "$PI_DIR/extensions"
   cp -f "$GUARD_SRC" "$PI_DIR/extensions/edit-guard.ts"
+  for ext in hashline.ts hashline-read.ts; do
+    if [[ -f "/opt/pi-bridge/$ext" ]]; then
+      cp -f "/opt/pi-bridge/$ext" "$PI_DIR/extensions/$ext"
+    fi
+  done
   echo "[pi-entrypoint] edit-guard extension installed"
 fi
 

@@ -30,6 +30,7 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { fileHash } from "./hashline.ts";
 
 // --- snapshot store ---------------------------------------------------------
 
@@ -39,13 +40,21 @@ const CONTENT_CAP = 512 * 1024;
 
 interface Snapshot {
 	hash: string; // short content fingerprint of the file as last seen
+	tag?: string; // 4-hex display tag (the [path#TAG] from read output); prefix of `hash`
 	text?: string; // content as last seen (omitted when too large)
 }
 
 const snapshots = new Map<string, Snapshot>(); // key: canonical path
 
+// Same normalization as hashline.ts's fileHash (BOM strip + CRLF→LF) so the
+// 4-hex read tag is always a strict prefix of the 8-hex snapshot hash.
 const hashText = (text: string) =>
-	crypto.createHash("sha256").update(text.replace(/\r\n/g, "\n")).digest("hex").slice(0, 8);
+	crypto
+		.createHash("sha256")
+		.update(text.replace(/^\uFEFF/, "").replace(/\r\n/g, "\n"))
+		.digest("hex")
+		.slice(0, 8)
+		.toUpperCase();
 
 const canonical = (p: string): string => {
 	try {
@@ -61,7 +70,11 @@ const currentSnapshot = (p: string): Snapshot | null => {
 		const st = fs.statSync(p);
 		if (!st.isFile()) return null;
 		const text = fs.readFileSync(p, "utf8");
-		return { hash: hashText(text), text: text.length <= CONTENT_CAP ? text : undefined };
+		return {
+			hash: hashText(text),
+			tag: fileHash(text),
+			text: text.length <= CONTENT_CAP ? text : undefined,
+		};
 	} catch {
 		return null; // binary (utf8 replacement chars are fine) or vanished
 	}
@@ -239,11 +252,15 @@ const interceptBash = (command: string, hasTool: (name: string) => boolean): str
 // --- extension --------------------------------------------------------------
 
 export default function (pi: ExtensionAPI) {
+	const tagOf = (s: Snapshot) => s.tag ?? s.hash.slice(0, 4);
+
 	const promptRule =
 		"<critical>NEVER use `sed`|`perl`|`python` via bash to issue individual edits; " +
 		"use the `edit` tool. Files must be `read` before `edit`/`write`; if a guard " +
 		"message says the file changed, use the shown region diff to fix up your " +
-		"change and retry — re-read (offset/limit) only when you need more context.</critical>";
+		"change and retry — re-read (offset/limit) only when you need more context. " +
+		"read output starts with [path#TAG] — quote the tag when reporting file state; " +
+		"line numbers are informational, edit with exact oldText only.</critical>";
 
 	// Layer 4: tool-discipline rule in the system prompt
 	pi.on("before_agent_start", async (event) => {
@@ -307,7 +324,7 @@ export default function (pi: ExtensionAPI) {
 					return {
 						block: true,
 						reason:
-							`File changed since you last read it (snapshot ${seen.hash}, on disk ${now.hash}). ` +
+							`File changed since you last read it (snapshot ${tagOf(seen)}, on disk now ${tagOf(now)}). ` +
 							"Something (bash, eval, another process) modified it out-of-band. " +
 							"Changed regions (old line numbers → current):\n\n" +
 							reveal +
@@ -319,7 +336,7 @@ export default function (pi: ExtensionAPI) {
 				return {
 					block: true,
 					reason:
-						`File changed since you last read it (snapshot ${seen.hash}, on disk ${now.hash}). ` +
+						`File changed since you last read it (snapshot ${tagOf(seen)}, on disk now ${tagOf(now)}). ` +
 						"Something (bash, eval, another process) modified it out-of-band, and the change is too large to summarize. " +
 						"Re-read the file and re-apply your change against the current content.",
 				};

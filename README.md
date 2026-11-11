@@ -42,7 +42,8 @@ should survive lives in `/work` (your project directory).
 - Base: `node:24-bookworm-slim`; installs `pi` globally via npm.
 - Adds bash, ca-certificates, git, ripgrep, curl, jq, fzf and a current Go
   toolchain, so agents can build/run Go projects out of the box.
-- Copies `klank/bridge.ts`, `extensions/edit-guard.ts` and
+- Copies `klank/bridge.ts`, `extensions/edit-guard.ts`,
+  `extensions/hashline.ts`, `extensions/hashline-read.ts` and
   `extensions/subagents/` into `/opt/pi-bridge/` for the entrypoint to
   install.
 - Grants passwordless `sudo` to any user (for apt/system work inside the
@@ -57,9 +58,9 @@ The container entrypoint:
 1. Reads `OPENCODE_API_KEY` (or falls back to `OPENAI_API_KEY`) from the
    environment and writes it into the pi `auth.json` (opencode login).
 2. Installs the pi extensions (`bridge.ts`, `edit-guard.ts`,
-   `subagents/`) into the pi extensions directory, agent definitions into
-   `~/.pi/agent/agents/` and workflow prompt templates into
-   `~/.pi/agent/prompts/`.
+   `hashline.ts`, `hashline-read.ts`, `subagents/`) into the pi extensions
+   directory, agent definitions into `~/.pi/agent/agents/` and workflow
+   prompt templates into `~/.pi/agent/prompts/`.
 3. Preselects the default model from `PI_DEFAULT_MODEL`
    (default: `opencode/glm-5.3-flash`) in `settings.json`.
 4. `exec`s `pi`.
@@ -92,7 +93,17 @@ The container entrypoint:
   and refreshes the snapshot, so the model can fix its edit from the block
   message alone. Block reasons always explain how to recover (use the shown
   diff, or re-read for large changes), so a blocked call costs one retry,
-  not a dead end.
+  not a dead end. Block reasons and snapshots quote the 4-hex file tag that
+  `hashline-read.ts` prints in read output, so reads, guard messages and
+  snapshots all reference one fingerprint.
+- **`extensions/hashline-read.ts`** — overrides the built-in `read` tool with
+  an omp hashline-style output format: text reads start with a
+  `[path#TAG]` header (TAG is a 4-hex content fingerprint shared with
+  edit-guard — quote it when reporting file state) and every line is
+  `N:`-prefixed with its 1-based source line number, stable across
+  continuation reads. Line numbers are informational only; the edit tool
+  still requires exact `oldText` matching. Image reads keep the built-in
+  behavior. Formatting primitives live in `extensions/hashline.ts`.
 - **`extensions/subagents/`** — subagent task delegation: registers the
   `subagent` tool, which spawns child `pi` processes (single, parallel
   batch, or sequential chain modes) with isolated context windows. Agents
@@ -282,7 +293,7 @@ Repository layout:
 - `Dockerfile` — the agent image.
 - `pi-entrypoint.sh` — container entrypoint.
 - `extensions/` — pi extensions baked into the image (`edit-guard.ts`,
-  `subagents/`).
+  `hashline.ts`, `hashline-read.ts`, `subagents/`).
 
 Notes for AI sessions working on klank:
 

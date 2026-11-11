@@ -30,6 +30,12 @@ COPY klank/bridge.ts /opt/pi-bridge/bridge.ts
 # bash intent interceptor) — installed into the extensions dir by the entrypoint
 COPY extensions/edit-guard.ts /opt/pi-bridge/edit-guard.ts
 
+# hashline extensions: shared fingerprint primitives + the `read` override
+# that emits [path#TAG] headers and N:-numbered lines (edit-guard.ts imports
+# ./hashline.ts, so both must be installed alongside it)
+COPY extensions/hashline.ts /opt/pi-bridge/hashline.ts
+COPY extensions/hashline-read.ts /opt/pi-bridge/hashline-read.ts
+
 # subagents extension: task delegation to isolated `pi` subprocesses
 # (single/parallel/chain modes, agents defined as markdown frontmatter) —
 # installed into the extensions dir by the entrypoint
