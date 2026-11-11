@@ -203,6 +203,26 @@ func recordAgent(db *sql.DB, cid, name, image, imageHash string, port int, tmuxS
 	return finalName
 }
 
+// reapAfterAttach cleans up the agent when its container ended while klank
+// was attached to it. Attach returns both on container exit and on client
+// detach (docker detach keys, tmux detach), so the decision is state-based:
+// only a container that is no longer running triggers cleanup. With --rm,
+// docker removes the container itself; this drops the database record so
+// the agent's name and ports are immediately reusable (klank new therefore
+// cleans up after itself instead of waiting for a later prune). A broken
+// docker daemon (dockerUnknown) keeps the record, like pruneDeadAgents.
+func reapAfterAttach(db *sql.DB, cid string) {
+	switch dockerAlive(cid) {
+	case dockerRunning:
+		return // detached by the user; the agent keeps running
+	case dockerUnknown:
+		cli.Debug("docker unavailable; skipping post-attach cleanup for %s", cid)
+	default: // dockerMissing (--rm already removed it) or dockerStopped (exited)
+		storage.DeleteAgent(db, cid)
+		fmt.Println("container exited; agent removed")
+	}
+}
+
 // New implements `klank new`: launch an agent container, record it and
 // attach to it (directly when inside tmux, via a dedicated tmux session
 // otherwise).
@@ -419,6 +439,7 @@ func New(db *sql.DB, cfg *config.Config, args []string) {
 		fmt.Printf("container saved: %s (agent %s, control port %d, tmux pane %s in session %s)\n", cid, finalName, port, ident.pane, ident.session)
 		fmt.Println("attaching...")
 		dockerAttach(cid)
+		reapAfterAttach(db, cid)
 		return
 	}
 
@@ -430,4 +451,5 @@ func New(db *sql.DB, cfg *config.Config, args []string) {
 	fmt.Printf("container saved: %s (agent %s, control port %d, tmux pane %s in session %s)\n", cid, finalName, port, ident.pane, ident.session)
 	fmt.Printf("attaching to tmux session %s...\n", ident.session)
 	tmuxAttachClient(ident.session, ident.pane)
+	reapAfterAttach(db, cid)
 }

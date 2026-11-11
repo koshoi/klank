@@ -252,6 +252,16 @@ func RenameAgent(db *sql.DB, idOrName, newName, cid, newTmuxSession string) {
 	cli.Debug("renamed agent %s to %s (tmux_session=%q)", idOrName, newName, newTmuxSession)
 }
 
+// DeleteAgent removes a single agent record by container id. Best-effort:
+// failures are logged but not fatal (a later prune removes the record).
+func DeleteAgent(db *sql.DB, cid string) {
+	if _, err := db.Exec(`DELETE FROM agents WHERE id = ?`, cid); err != nil {
+		cli.Debug("delete agent %s: %v", cid, err)
+		return
+	}
+	cli.Debug("deleted agent record: %s", cid)
+}
+
 // UpdateAgentTmux backfills the tmux identity of an already saved agent.
 func UpdateAgentTmux(db *sql.DB, cid, tmuxSession, tmuxPane string) {
 	if _, err := db.Exec(`UPDATE agents SET tmux_session = ?, tmux_pane = ? WHERE id = ?`, tmuxSession, tmuxPane, cid); err != nil {
