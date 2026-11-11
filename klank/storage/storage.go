@@ -4,6 +4,7 @@ package storage
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -13,6 +14,16 @@ import (
 
 	"klank/cli"
 )
+
+// PortMapping describes one named container port published to the host's
+// loopback (see `klank new -p name=container-port`). Name is the handle
+// used by `klank port <agent> <name>`; Container is the port inside the
+// container, Host the port published on 127.0.0.1.
+type PortMapping struct {
+	Name      string `json:"name"`
+	Container int    `json:"container"`
+	Host      int    `json:"host"`
+}
 
 // Open opens (and creates, if needed) the agent database.
 func Open() *sql.DB {
@@ -71,6 +82,7 @@ func migrate(db *sql.DB) {
 		{"tmux_session", "TEXT"},
 		{"tmux_pane", "TEXT"},
 		{"port", "INTEGER DEFAULT 0"},
+		{"ports", "TEXT DEFAULT ''"},
 	} {
 		if existing[col.name] {
 			continue
@@ -87,12 +99,12 @@ func migrate(db *sql.DB) {
 // picks the first free agent%03d name (not max(seq)+1) so renamed agents
 // cannot make the insert fail; the single-statement insert means an
 // interrupted klank can never leave a placeholder-named row behind.
-func InsertAgent(db *sql.DB, cid, name, image, imageHash string, port int, tmuxSession, tmuxPane string) (string, error) {
+func InsertAgent(db *sql.DB, cid, name, image, imageHash string, port int, tmuxSession, tmuxPane, ports string) (string, error) {
 	if name == "" {
 		name = NextAgentName(db)
 	}
-	if _, err := db.Exec(`INSERT INTO agents (id, name, image, image_hash, port, tmux_session, tmux_pane) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		cid, name, image, imageHash, port, tmuxSession, tmuxPane); err != nil {
+	if _, err := db.Exec(`INSERT INTO agents (id, name, image, image_hash, port, tmux_session, tmux_pane, ports) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		cid, name, image, imageHash, port, tmuxSession, tmuxPane, ports); err != nil {
 		if strings.Contains(err.Error(), "UNIQUE constraint failed") {
 			return "", fmt.Errorf("agent name %q is already in use", name)
 		}
@@ -118,7 +130,7 @@ func ListAgents(db *sql.DB) *cli.QueryResult {
 
 // GetAgent returns stored data for an agent by id or name.
 func GetAgent(db *sql.DB, idOrName string) (*cli.QueryResult, bool) {
-	rows, err := db.Query(`SELECT id, image, coalesce(tmux_session,'-') as tmux_session, coalesce(tmux_pane,'-') as tmux_pane FROM agents WHERE name = ? OR id = ?`, idOrName, idOrName)
+	rows, err := db.Query(`SELECT id, image, coalesce(tmux_session,'-') as tmux_session, coalesce(tmux_pane,'-') as tmux_pane, coalesce(ports,'-') as ports FROM agents WHERE name = ? OR id = ?`, idOrName, idOrName)
 	if err != nil {
 		cli.Fatal("query: %v", err)
 	}
@@ -157,6 +169,26 @@ func GetAgentPort(db *sql.DB, idOrName string) (cid string, port int, ok bool) {
 		cli.Fatal("query: %v", err)
 	}
 	return cid, port, true
+}
+
+// GetAgentPorts resolves an agent by id or name, returning its container
+// id and named port mappings (nil when none were published).
+func GetAgentPorts(db *sql.DB, idOrName string) (cid string, ports []PortMapping, ok bool) {
+	var raw string
+	err := db.QueryRow(`SELECT id, coalesce(ports,'') FROM agents WHERE name = ? OR id = ?`, idOrName, idOrName).
+		Scan(&cid, &raw)
+	if err == sql.ErrNoRows {
+		return "", nil, false
+	}
+	if err != nil {
+		cli.Fatal("query: %v", err)
+	}
+	if raw != "" && raw != "-" {
+		if err := json.Unmarshal([]byte(raw), &ports); err != nil {
+			cli.Fatal("parse named ports for agent %s: %v", idOrName, err)
+		}
+	}
+	return cid, ports, true
 }
 
 // AgentName resolves an agent by id or name and returns its stored name

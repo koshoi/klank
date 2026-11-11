@@ -2,11 +2,14 @@ package command
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 
 	"klank/cli"
@@ -24,6 +27,81 @@ func controlPort() int {
 	}
 	defer l.Close()
 	return l.Addr().(*net.TCPAddr).Port
+}
+
+// sortedPortNames returns config [ports] names in deterministic
+// (alphabetical) order — TOML maps have no stable order.
+func sortedPortNames(ports map[string]int) []string {
+	names := make([]string, 0, len(ports))
+	for n := range ports {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// allocateHostPort returns a free loopback port "reasonably close" to want:
+// it scans upward from want (up to 1000 ports, skipping already-claimed
+// ones) and falls back to a random free port. Ports below 1024 usually fail
+// to bind for unprivileged users, which the scan naturally skips. The bind
+// is only a probe (closed immediately), so an unlucky race can still lose
+// the port to another process between probe and docker run.
+func allocateHostPort(want int, claimed map[int]bool) int {
+	for p := want; p < want+1000 && p <= 65535; p++ {
+		if claimed[p] {
+			continue
+		}
+		l, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", p))
+		if err != nil {
+			cli.Debug("host port %d unavailable: %v", p, err)
+			continue
+		}
+		l.Close()
+		claimed[p] = true
+		return p
+	}
+	// fallback: any free ephemeral port
+	p := controlPort()
+	claimed[p] = true
+	return p
+}
+
+// parsePortFlag parses a `-p name=container-port` value, validating the
+// port name (single token, no '=' or whitespace) and the port number.
+func parsePortFlag(v string) (name string, container int) {
+	n, p, ok := strings.Cut(v, "=")
+	if !ok || n == "" || p == "" {
+		cli.Fatal("invalid port %q (expected name=container-port, e.g. http=80)", v)
+	}
+	if strings.ContainsAny(n, " \t\n") {
+		cli.Fatal("invalid port name %q (no whitespace allowed)", n)
+	}
+	port, err := strconv.Atoi(p)
+	if err != nil || port < 1 || port > 65535 {
+		cli.Fatal("invalid container port in %q (expected 1-65535)", v)
+	}
+	return n, port
+}
+
+// writePortsFile records the named port mappings in /ports inside the
+// container so the agent can discover where its services are published on
+// the host (the system-prompt addendum points it at the file). Runs as root
+// via docker exec: / is not writable by the container's unprivileged user.
+// Best-effort: failure warns but never blocks the launch.
+func writePortsFile(cid string, ports []storage.PortMapping) {
+	var b strings.Builder
+	b.WriteString("# klank named ports: name  container-port  published-address\n")
+	for _, p := range ports {
+		fmt.Fprintf(&b, "%s\t%d\t127.0.0.1:%d\n", p.Name, p.Container, p.Host)
+	}
+	x := exec.Command("docker", "exec", "-i", "-u", "root", cid,
+		"sh", "-c", "cat > /ports && chmod 644 /ports")
+	x.Stdin = strings.NewReader(b.String())
+	if out, err := x.CombinedOutput(); err != nil {
+		cli.Warn("write /ports in container: %v\n%s", err, strings.TrimSpace(string(out)))
+	} else {
+		cli.Debug("wrote /ports (%d named ports)", len(ports))
+	}
 }
 
 // agentNameFromCwd derives an agent name from a directory path: the
@@ -105,8 +183,17 @@ func appendEnvPair(pairs []string, pair string) []string {
 
 // recordAgent saves a just-started container in the database; on failure the
 // container is removed so a failed save never leaves an orphan running.
-func recordAgent(db *sql.DB, cid, name, image, imageHash string, port int, tmuxSession, tmuxPane string) string {
-	finalName, err := storage.InsertAgent(db, cid, name, image, imageHash, port, tmuxSession, tmuxPane)
+func recordAgent(db *sql.DB, cid, name, image, imageHash string, port int, tmuxSession, tmuxPane string, ports []storage.PortMapping) string {
+	var portsJSON string
+	if len(ports) > 0 {
+		b, err := json.Marshal(ports)
+		if err == nil {
+			portsJSON = string(b)
+		} else {
+			cli.Debug("marshal named ports: %v", err)
+		}
+	}
+	finalName, err := storage.InsertAgent(db, cid, name, image, imageHash, port, tmuxSession, tmuxPane, portsJSON)
 	if err != nil {
 		if rmErr := exec.Command("docker", "rm", "-f", cid).Run(); rmErr != nil {
 			cli.Debug("docker rm -f %s: %v", cid, rmErr)
@@ -124,6 +211,12 @@ func New(db *sql.DB, cfg *config.Config, args []string) {
 	name := ""
 	imageName := ""
 	envPairs := []string{} // ordered, dedup'd on later -e occurrences
+	type namedPort struct {
+		name      string
+		container int
+	}
+	var portFlags []namedPort // ordered -p name=container-port occurrences
+	portNames := map[string]bool{}
 	allowHome := false
 	useIPv6 := cfg.UseIPv6() // opt-in default (config: ipv6 = true)
 	for i := 0; i < len(args); i++ {
@@ -155,6 +248,17 @@ func New(db *sql.DB, cfg *config.Config, args []string) {
 				cli.Fatal("%s requires a KEY=VALUE pair", a)
 			}
 			envPairs = appendEnvPair(envPairs, args[i+1])
+			i++
+		case "-p", "--port":
+			if i+1 >= len(args) {
+				cli.Fatal("%s requires a name=container-port pair", a)
+			}
+			n, container := parsePortFlag(args[i+1])
+			if portNames[n] {
+				cli.Fatal("port name %q given twice", n)
+			}
+			portNames[n] = true
+			portFlags = append(portFlags, namedPort{n, container})
 			i++
 		default:
 			if name != "" {
@@ -249,10 +353,35 @@ func New(db *sql.DB, cfg *config.Config, args []string) {
 	}
 	uid, gid := currentUserIDs()
 	port := controlPort()
+	// named ports: the config's [ports] section supplies defaults (for
+	// ports that are common to every launch in this project); -p flags
+	// override them by name and can add ports not mentioned in config.
+	// Each is published on the host loopback close to its container port
+	// (the control port is claimed first so the two can never collide).
+	effectivePorts := portFlags
+	for _, cfgName := range sortedPortNames(cfg.Ports) {
+		if !portNames[cfgName] {
+			effectivePorts = append(effectivePorts, namedPort{cfgName, cfg.Ports[cfgName]})
+		}
+	}
+	claimed := map[int]bool{port: true}
+	var namedPorts []storage.PortMapping
+	for _, np := range effectivePorts {
+		host := allocateHostPort(np.container, claimed)
+		namedPorts = append(namedPorts, storage.PortMapping{
+			Name: np.name, Container: np.container, Host: host,
+		})
+		cli.Debug("named port %s: container %d -> host %d", np.name, np.container, host)
+	}
 	run := exec.Command("docker", "run", "-d", "--rm", "-it",
 		"--user", fmt.Sprintf("%d:%d", uid, gid),
 		"-v", fmt.Sprintf("%s:/work", cwd),
-		"-p", fmt.Sprintf("127.0.0.1:%d:%d", port, port), // control server (bridge.ts)
+		"-p", fmt.Sprintf("127.0.0.1:%d:%d", port, port)) // control server (bridge.ts)
+	for _, np := range namedPorts {
+		run.Args = append(run.Args,
+			"-p", fmt.Sprintf("127.0.0.1:%d:%d", np.Host, np.Container))
+	}
+	run.Args = append(run.Args,
 		"-e", fmt.Sprintf("KLANK_PORT=%d", port))
 	if name != "" {
 		// name the container after the agent so `docker ps` matches klank's view
@@ -278,9 +407,15 @@ func New(db *sql.DB, cfg *config.Config, args []string) {
 	cid := strings.TrimSpace(string(out))
 	cli.Debug("container id: %s", cid)
 	imageHash := dockerImageHash(cid)
+	if len(namedPorts) > 0 {
+		writePortsFile(cid, namedPorts)
+	}
+	for _, np := range namedPorts {
+		fmt.Printf("named port %s: container %d -> 127.0.0.1:%d\n", np.Name, np.Container, np.Host)
+	}
 
 	if startingInTmux {
-		finalName := recordAgent(db, cid, name, image, imageHash, port, ident.session, ident.pane)
+		finalName := recordAgent(db, cid, name, image, imageHash, port, ident.session, ident.pane, namedPorts)
 		fmt.Printf("container saved: %s (agent %s, control port %d, tmux pane %s in session %s)\n", cid, finalName, port, ident.pane, ident.session)
 		fmt.Println("attaching...")
 		dockerAttach(cid)
@@ -289,7 +424,7 @@ func New(db *sql.DB, cfg *config.Config, args []string) {
 
 	// outside tmux: create the agent's tmux session with the container
 	// attached inside its pane, record the pane, then attach the terminal.
-	finalName := recordAgent(db, cid, name, image, imageHash, port, "", "")
+	finalName := recordAgent(db, cid, name, image, imageHash, port, "", "", namedPorts)
 	ident = tmuxStartAgentSession(finalName, cid)
 	storage.UpdateAgentTmux(db, cid, ident.session, ident.pane)
 	fmt.Printf("container saved: %s (agent %s, control port %d, tmux pane %s in session %s)\n", cid, finalName, port, ident.pane, ident.session)

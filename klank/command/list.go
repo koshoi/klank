@@ -16,7 +16,10 @@ import (
 // dead daemon never wipes the database.
 func pruneDeadAgents(db *sql.DB) {
 	storage.PruneAgents(db, func(cid string) bool {
-		return dockerAlive(cid) == dockerRunning
+		if dockerAlive(cid) == dockerMissing {
+			return false // container gone: prune
+		}
+		return true // running, stopped or docker itself broken: keep
 	})
 }
 

@@ -198,6 +198,14 @@ klank send [-w] [--timeout s] <id|name> <text...>
 klank status <id|name>
                   show an agent's live state (busy/idle, model, session,
                   context usage) via its control server
+klank port <id|name> [<name>]
+                  print the local address of a named container port
+                  (with a port name: only that address, e.g.
+                  127.0.0.1:81; without one: all of them)
+klank config [-f] copy the current config (user config, falling back
+                  to the system config; a commented starter template
+                  when neither exists) to ./.klank.toml for per-project
+                  editing (-f overwrites an existing file)
 klank debug query <sql>
                   run a read-only SQL query against the database
 klank debug data  show table schemas
@@ -212,6 +220,15 @@ for `list`, `get`, `debug`), `-h` (help).
   default image.
 - `-e, --env KEY=VALUE` — environment variable for the container
   (repeatable; overrides the configured env file).
+- `-p, --port name=container-port` — publish a named container port on
+  the local machine (repeatable, e.g. `-p http=80 -p grpc=8000`). Ports
+  from the config's `[ports]` section are published automatically;
+  `-p` overrides them by name and can add ports not mentioned in
+  config. Each is bound to `127.0.0.1` on a free local port as close
+  as possible to the container port. Mappings are saved in the agent
+  database (see `klank port`) and written to `/ports` inside the
+  container, where the system-prompt addendum tells the agent to look
+  them up.
 
 `new` also takes the agent name as a positional argument (`klank new
 myagent`); when started outside tmux it is also the tmux session name.
@@ -255,6 +272,20 @@ Keys:
   inside the container and on the host (bind mount). Secrets therefore
   never appear in `docker inspect`, process listings, or `docker run`
   arguments, and are gone from disk right after first use.
+- `[ports]` — default named container ports published for every new
+  agent, for ports that are common across launches:
+
+  ```toml
+  [ports]
+  http = 80
+  grpc = 8000
+  ```
+
+  These behave exactly like `-p http=80 -p grpc=8000` on every
+  `klank new`; a `-p` flag with the same name overrides the config
+  entry for that launch. Run `klank config` to copy your current
+  config into `./.klank.toml` as a starting point for per-project
+  settings.
 
 ### Database
 

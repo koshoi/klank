@@ -52,6 +52,16 @@ commands:
                    rename an agent (a recorded tmux session name
                    matching the old name is updated in the database;
                    the tmux session itself is left untouched)
+  port <id|name> [<name>]
+                   print the local address of a named container port
+                   published with new -p: with a port name, only that
+                   address (e.g. 127.0.0.1:81); without one, all of
+                   them as name/port/address lines
+  config [-f]       copy the current config (the user config,
+                   falling back to the system config; a commented
+                   starter template when neither exists) to
+                   ./.klank.toml for per-project editing
+                   (-f overwrites an existing file)
 
 flags:
   -h               show help
@@ -73,6 +83,14 @@ new flags:
   -e, --env KEY=VALUE
                    environment variable passed to the container;
                    repeatable
+  -p, --port name=container-port
+                   publish a named container port on the local
+                   machine; repeatable (e.g. -p http=80 -p grpc=8000).
+                   Ports from the config's [ports] section are
+                   published automatically; -p overrides them by name.
+                   The local port is picked free and close to the
+                   container port; mappings are saved in the agent
+                   database and in the container's /ports file
 
 send flags:
   -w, --wait       wait until the agent settles after the message
@@ -84,6 +102,8 @@ examples:
   klank new -n worker
   klank new -e FOO=bar -e BAZ=qux --allow-home
   klank new --ipv6
+  klank new -p http=80 -p http2=8080 -p grpc=8000
+  klank port worker http
   klank curl agent001 /status
   klank curl agent001 /send -d 'test'
   klank -j list
@@ -94,6 +114,7 @@ examples:
   klank send -w agent001 run the test suite
   klank status agent001
   klank rename agent001 worker
+  klank config
 `
 
 func main() {
@@ -170,6 +191,10 @@ func main() {
 		command.Curl(db, rest)
 	case "rename":
 		command.Rename(db, rest)
+	case "config":
+		command.Config(rest)
+	case "port":
+		command.Port(db, rest)
 	case "debug":
 		command.Debug(db, rest)
 	case "help":

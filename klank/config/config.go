@@ -24,9 +24,10 @@ import (
 
 // Config holds the configurable klank settings.
 type Config struct {
-	Image   string `toml:"image"`    // default container image for "klank new"
-	EnvFile string `toml:"env_file"` // path to a default env file passed to the container
-	IPv6    *bool  `toml:"ipv6"`     // launch agents on an IPv6-enabled docker network (default false; nil means default)
+	Image   string         `toml:"image"`    // default container image for "klank new"
+	EnvFile string         `toml:"env_file"` // path to a default env file passed to the container
+	IPv6    *bool          `toml:"ipv6"`     // launch agents on an IPv6-enabled docker network (default false; nil means default)
+	Ports   map[string]int `toml:"ports"`    // default named ports published for every new agent (see [ports] in config.toml)
 }
 
 // DefaultIPv6 is the built-in default for IPv6 agent networking. Agents run
@@ -47,8 +48,11 @@ func (c *Config) UseIPv6() bool {
 // DefaultImage is the built-in default container image.
 const DefaultImage = "klank:latest"
 
-// userConfigPath returns the user-level config file path.
-func userConfigPath() string {
+// SystemConfigPath is the system-level config file path.
+const SystemConfigPath = "/etc/klank/config.toml"
+
+// UserConfigPath returns the user-level config file path.
+func UserConfigPath() string {
 	if xdg := os.Getenv("XDG_CONFIG_HOME"); xdg != "" {
 		return filepath.Join(xdg, "klank", "config.toml")
 	}
@@ -79,9 +83,9 @@ func loadConfigFile(path, desc string, cfg *Config) {
 func Load() *Config {
 	cfg := &Config{Image: DefaultImage}
 	for _, path := range []string{
-		"/etc/klank/config.toml", // system
-		userConfigPath(),         // user
-		".klank.toml",            // project
+		SystemConfigPath, // system
+		UserConfigPath(), // user
+		".klank.toml",    // project
 	} {
 		if path == "" {
 			continue
@@ -91,6 +95,11 @@ func Load() *Config {
 	// environment overrides file configs
 	if v := os.Getenv("KLANK_IMAGE"); v != "" {
 		cfg.Image = v
+	}
+	for name, port := range cfg.Ports {
+		if port < 1 || port > 65535 {
+			cli.Fatal("invalid config [ports] entry %s = %d (expected 1-65535)", name, port)
+		}
 	}
 	return cfg
 }
