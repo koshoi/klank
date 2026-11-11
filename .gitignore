@@ -6,7 +6,7 @@
 
 # built binary
 klank/klank
-klank-proxy-watcher/klank-proxy-watcher
+klankd/klankd
 
 # go test/tooling artifacts
 *.test

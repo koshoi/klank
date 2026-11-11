@@ -1,4 +1,4 @@
-// klank-proxy-watcher: a standalone daemon that gives every service
+// klankd: a standalone daemon that gives every service
 // inside a klank container a stable hostname and runs its own caddy.
 //
 // It polls klank's sqlite database (~/.klank/klank.db), keeps a
@@ -10,8 +10,8 @@
 // dies, reloaded (SIGUSR1) when the config changes. One systemd unit
 // is the entire deployment — no separate caddy service.
 //
-// Build:  CGO_ENABLED=0 go build -o klank-proxy-watcher .
-// Run:    ./klank-proxy-watcher            (as the klank user; see -h)
+// Build:  CGO_ENABLED=0 go build -o klankd .
+// Run:    ./klankd            (as the klank user; see -h)
 package main
 
 import (
@@ -52,7 +52,7 @@ type portMapping struct {
 
 func main() {
 	log.SetFlags(log.LstdFlags)
-	log.SetPrefix("klank-proxy-watcher: ")
+	log.SetPrefix("klankd: ")
 
 	interval := flag.Duration("i", 2*time.Second, "poll interval (min 250ms)")
 	file := flag.String("f", "", "Caddyfile path; the dashboard (index.html, klank-agents.json) is written next to it (default ~/.klank/Caddyfile)")
@@ -263,7 +263,7 @@ func loadRoutes(db *sql.DB, domain string) ([]route, error) {
 // byte-identical files (content comparison decides when to reload).
 func renderCaddyfile(routes []route, domain, dashboardRoot string) string {
 	var b strings.Builder
-	b.WriteString("# managed by klank-proxy-watcher -- DO NOT EDIT\n")
+	b.WriteString("# managed by klankd -- DO NOT EDIT\n")
 	// explicit http:// scheme: without it caddy treats every site as
 	// HTTPS (auto-redirect + local TLS certs), which breaks plain-http
 	// *.klank.localhost names that never leave the machine

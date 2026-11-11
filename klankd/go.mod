@@ -1,4 +1,4 @@
-module klank-proxy-watcher
+module klankd
 
 go 1.22
 
