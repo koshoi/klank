@@ -7,6 +7,8 @@
 //   GET  /          discovery API: service info + endpoint listing
 //   GET  /health     liveness probe -> {"ok":true}
 //   GET  /status     agent state: busy/idle, model, session, context usage
+//   GET  /messages   recent transcript messages, indexed newest-first
+//                    (?from=0&limit=1&role=user,assistant&text=1)
 //   POST /message    body = message text, injected as a user message
 //                    (?wait=1 holds the response until the agent settles)
 //
@@ -200,9 +202,129 @@ export default function (pi: ExtensionAPI) {
 			{ method: "GET", path: "/", description: "this discovery document" },
 			{ method: "GET", path: "/health", description: `liveness probe -> ${JSON.stringify({ ok: true })}` },
 			{ method: "GET", path: "/status", description: "agent state: busy/idle, model, session, context usage" },
+			{ method: "GET", path: "/messages", description: "recent transcript messages, newest-first (?from=0 offset, ?limit=1, ?role=user,assistant,toolResult, ?text=1 flattens content to text)" },
 			{ method: "POST", path: "/message", description: "inject a user message (body = text; ?wait=1 long-polls until the agent settles)" },
 		],
 	});
+
+	// ---- GET /messages helpers ----
+
+	// parseCount validates a non-negative integer query param; null = invalid,
+	// missing/empty = fallback (0)
+	const parseCount = (raw: string | null): number | null => {
+		if (raw === null || raw === "") return 0;
+		if (!/^\d+$/.test(raw)) return null;
+		const n = Number.parseInt(raw, 10);
+		return Number.isSafeInteger(n) ? n : null;
+	};
+
+	const LIMIT_MAX = 500;
+	const MESSAGE_ROLES = new Set(["user", "assistant", "toolResult"]);
+
+	// flattenText joins text blocks of a message content (string or block array)
+	const flattenText = (content: unknown): string => {
+		if (typeof content === "string") return content;
+		if (!Array.isArray(content)) return "";
+		return content
+			.filter((b) => b && typeof b === "object" && (b as AnyBlock).type === "text")
+			.map((b) => (b as AnyBlock).text ?? "")
+			.join("\n\n");
+	};
+
+	type AnyBlock = { type?: string; text?: string; id?: string; name?: string; arguments?: unknown };
+	type AnyEntry = { type?: string; id?: string; parentId?: string | null; timestamp?: string; message?: AnyMsg };
+	type AnyMsg = {
+		role?: string;
+		content?: unknown;
+		provider?: string;
+		model?: string;
+		stopReason?: string;
+		toolName?: string;
+		isError?: boolean;
+	};
+
+	// shapeMessage projects a session entry into the wire format for /messages
+	const shapeMessage = (entry: AnyEntry, raw: boolean): Record<string, unknown> => {
+		const msg = entry.message ?? {};
+		const role = msg.role ?? "";
+		const out: Record<string, unknown> = {
+			id: entry.id ?? null,
+			parentId: entry.parentId ?? null,
+			timestamp: entry.timestamp ?? null,
+			role,
+		};
+		if (raw) {
+			out.content = msg.content ?? [];
+		} else {
+			out.text = flattenText(msg.content);
+		}
+		if (role === "assistant") {
+			if (msg.model) out.model = { id: msg.model, provider: msg.provider ?? null };
+			if (msg.stopReason) out.stopReason = msg.stopReason;
+			const blocks = Array.isArray(msg.content) ? (msg.content as AnyBlock[]) : [];
+			out.toolCalls = blocks
+				.filter((b) => b?.type === "toolCall")
+				.map((b) => ({ id: b.id ?? null, name: b.name ?? null, arguments: b.arguments ?? {} }));
+		} else if (role === "toolResult") {
+			out.toolName = msg.toolName ?? null;
+			out.isError = Boolean(msg.isError);
+		}
+		return out;
+	};
+
+	const messagesPayload = (url: URL): Record<string, unknown> | { error: string } => {
+		const sp = url.searchParams;
+
+		const from = parseCount(sp.get("from"));
+		if (from === null) return { error: "invalid from: expected a non-negative integer" };
+		const limitRaw = parseCount(sp.get("limit"));
+		if (limitRaw === null) return { error: "invalid limit: expected a non-negative integer" };
+		const limit = Math.min(Math.max(limitRaw, 1), LIMIT_MAX);
+
+		const roleParam = sp.get("role");
+		let roles: Set<string> | null = null;
+		if (roleParam) {
+			roles = new Set<string>();
+			for (const r of roleParam.split(",")) {
+				const role = r.trim();
+				if (!role) continue; // tolerate empty items ("user,", " user")
+				if (!MESSAGE_ROLES.has(role)) return { error: `invalid role: ${role} (allowed: user, assistant, toolResult)` };
+				roles.add(role);
+			}
+			if (roles.size === 0) roles = null; // "," or whitespace-only = no filter
+		}
+
+		const textParam = sp.get("text") ?? "1";
+		if (textParam !== "0" && textParam !== "1") return { error: "invalid text: expected 0 or 1" };
+		const raw = textParam === "0";
+
+		// buildContextEntries gives the active branch with compaction applied;
+		// branch order is oldest -> newest
+		const sm = lastCtx?.sessionManager as unknown as
+			| { buildContextEntries?: () => AnyEntry[]; getBranch?: () => AnyEntry[] }
+			| undefined;
+		const call = (fn: unknown): AnyEntry[] => (typeof fn === "function" ? (fn as () => AnyEntry[])() : []);
+		const entries = call(sm?.buildContextEntries) || call(sm?.getBranch);
+
+		const filtered = entries.filter((e) => {
+			if (!e || e.type !== "message") return false;
+			const role = e.message?.role;
+			if (!role || role === "system" || role === "custom") return false;
+			return !roles || roles.has(role);
+		});
+
+		// total reflects the role filter (if any), not the whole transcript,
+		// so clients can paginate through the filtered set with from/limit
+
+		// newest-first indexing: reverse, then slice [from, from+limit)
+		const newestFirst = filtered.reverse(); // filtered is a fresh array from .filter()
+		const slice = newestFirst.slice(from, from + limit);
+		return {
+			total: filtered.length,
+			count: slice.length,
+			messages: slice.map((e) => shapeMessage(e, raw)),
+		};
+	};
 
 	const server = http.createServer(async (req, res) => {
 		const url = new URL(req.url || "/", "http://klank");
@@ -217,6 +339,15 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (req.method === "GET" && url.pathname === "/status") {
 				json(res, 200, statusPayload());
+				return;
+			}
+			if (req.method === "GET" && url.pathname === "/messages") {
+				const payload = messagesPayload(url);
+				if ("error" in payload) {
+					json(res, 400, payload);
+					return;
+				}
+				json(res, 200, payload);
 				return;
 			}
 			if (req.method === "POST" && url.pathname === "/message") {

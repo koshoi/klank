@@ -75,6 +75,10 @@ The container entrypoint:
 
   - `GET /health` — liveness probe
   - `GET /status` — agent state: busy/idle, model, session, context usage
+  - `GET /messages` — recent transcript messages, indexed newest-first
+    (`?from=0` offset, `?limit=1`, `?role=user,assistant,toolResult`,
+    `?text=1` flattens content blocks to plain text; `text=0` returns raw
+    blocks under a `content` key instead)
   - `POST /message` — body is injected as a user message (queued as a
     steering message when the agent is mid-run); `?wait=1` long-polls until
     the agent settles, which is what powers `klank send -w` with no
