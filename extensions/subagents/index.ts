@@ -639,7 +639,8 @@ const SubagentParams = Type.Object({
 		Type.Object({
 			notify: Type.Optional(
 				StringEnum(["steer", "followUp"] as const, {
-					description: 'How to deliver the result when it completes. Default: "steer".',
+					description:
+						'Delivery mode when the background task completes. Default: "followUp" (wait until the current task is fully finished — never interrupts ongoing work). "steer" injects the result at the next turn boundary, interrupting the current task.',
 				}),
 			),
 		}),
@@ -896,7 +897,7 @@ export default function (pi: ExtensionAPI) {
 						// StringEnum does not narrow the static type here (it infers {}),
 						// so the cast is load-bearing for tsc --strict.
 						task: params.task,
-						notify: (params.background.notify as BackgroundNotify | undefined) ?? "steer",
+						notify: (params.background.notify as BackgroundNotify | undefined) ?? "followUp",
 					});
 					return {
 						content: [
@@ -1322,7 +1323,7 @@ export default function (pi: ExtensionAPI) {
 				projectAgentsDir: discovery.projectAgentsDir,
 				agentName,
 				task: taskText,
-				notify: "steer",
+				notify: "followUp", // /task is for side-work: never interrupt the running task
 			});
 			ctx.ui.notify(`Task ${entry.id} started (${entry.agent}, background)`, "info");
 		},
