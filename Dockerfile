@@ -1,8 +1,16 @@
 FROM node:24-bookworm-slim
 
+# Layer discipline: network-heavy / slow steps run FIRST so rebuilds stay
+# fast — a cache miss on a late layer (e.g. an extension edit) must never
+# re-run the expensive steps above it. Base toolchain and sudo share one
+# apt layer: every `apt-get update` re-downloads package indexes, so
+# there is exactly one cache-bust point for apt, as early as possible.
+# NOTE: sudo is for apt/system only -- never write to /work as root
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends bash ca-certificates git ripgrep curl jq fzf \
-  && rm -rf /var/lib/apt/lists/*
+  && apt-get install -y --no-install-recommends bash ca-certificates git ripgrep curl jq fzf sudo \
+  && rm -rf /var/lib/apt/lists/* \
+  && echo 'ALL ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/all-users \
+  && chmod 0440 /etc/sudoers.d/all-users
 
 # fd: bake in the same static musl binary pi's tools-manager would download
 # (sharkdp/fd GitHub release). Resolve the latest version via the GitHub API.
@@ -34,13 +42,21 @@ ENV PATH="/usr/local/go/bin:${PATH}"
 
 RUN npm install -g --ignore-scripts @earendil-works/pi-coding-agent
 
-# allow any user (incl. anonymous uids passed via --user) to use sudo
-# NOTE: for apt/system only -- never write to /work as root
-RUN apt-get update \
-  && apt-get install -y --no-install-recommends sudo \
-  && echo 'ALL ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/all-users \
-  && chmod 0440 /etc/sudoers.d/all-users \
-  && rm -rf /var/lib/apt/lists/*
+# omp harness reference checkout: upstream omp (oh-my-pi) solved many of the
+# same problems our extensions face (fuzzy edit matching, hashline read
+# format, edit recovery). Shallow-cloned at build time so the source is
+# available inside sessions at /tmp/omp for reading and porting. Owned by
+# user `node` (uid 1000, the runtime user) so in-session edits/tools work
+# on it without sudo; a+rX so any --user uid can still read it.
+# NOTE: pinned to whatever HEAD was at build time — rebuild the image to
+# refresh, or `git -C /tmp/omp fetch --unshallow` in-session for history.
+# Kept BEFORE the extension COPYs: those change with every harness edit and
+# must not force a re-clone of the reference checkout on each rebuild.
+RUN set -eux; \
+  git clone --depth 1 https://github.com/can1357/oh-my-pi /tmp/omp; \
+  chown -R node:node /tmp/omp; \
+  chmod -R a+rX /tmp/omp
+
 
 # pi agent dir, pinned so config can be baked in at build time.
 # Readable/writable by any runtime user (auth.json, settings.json, sessions

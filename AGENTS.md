@@ -39,6 +39,43 @@ Because of this:
   bridge / image), not by hand-patching the installed pi package at runtime.
   Runtime patches vanish when the container is rebuilt.
 
+## Porting from omp
+
+Features may be **copied from omp** (the oh-my-pi harness by can1357), which
+solved many of the same problems our extensions address (fuzzy edit
+matching, whitespace/indentation handling, hashline read format, edit-error
+recovery). A shallow reference checkout is baked into the image at
+**`/tmp/omp`**, owned by user `node` so you can work on it directly:
+
+- Key sources: `crates/pi-edit/src/` (fuzzy match ladder, indentation
+  adjustment in `text.rs`, `modes/replace.rs`),
+  `packages/coding-agent/src/edit/` (normalize, auto-repair, settings), and
+  `packages/coding-agent/src/prompts/tools/read.md` (read-format prompt
+  wording).
+- The checkout is **pinned to the image build date**; it has full working
+  tree but shallow history. Rebuild the image to refresh it, or
+  `git -C /tmp/omp fetch --unshallow` in-session for full history.
+- /tmp is ephemeral in principle, but the image-layer clone survives for
+  the container's lifetime; treat /tmp/omp as read-mostly reference — port
+  code into this repo's extensions rather than editing it in place.
+
+## Dockerfile layer discipline
+
+Long-running and network-heavy operations (apt installs, toolchain
+downloads, git clones, npm installs) must appear **as early as possible**
+in the `Dockerfile`. Docker cache-invalidation is sequential: any changed
+layer invalidates every layer after it, so a step that changes frequently
+(an extension `COPY`) must never sit above a slow step — otherwise every
+harness edit re-downloads Go and re-clones the reference repo.
+
+Ordering rules, in practice:
+
+1. apt layers first (and merged — one `apt-get update` total),
+2. then big downloads (Go tarball, fd binary, pi npm install),
+3. then rarely-changing remote snapshots (the `/tmp/omp` clone),
+4. `COPY` of frequently-edited local files (extensions, entrypoint) last,
+   so their cache miss costs nothing but the copy.
+
 ## Practical notes
 
 - Named published ports are listed in `/ports` (name, container port, and
