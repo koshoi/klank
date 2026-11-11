@@ -1,0 +1,53 @@
+# klank-proxy-watcher systemd template unit.
+#
+# One service handles everything: it polls the klank database, generates
+# the Caddyfile + dashboard, and runs caddy as a supervised child
+# process (started on boot, restarted if it dies, reloaded on change).
+# There is deliberately NO separate caddy.service.
+#
+#   sudo systemctl enable --now klank-proxy-watcher@okoshovetc.service
+#
+# journal:   journalctl -u klank-proxy-watcher@okoshovetc -f
+
+[Unit]
+Description=klank proxy watcher (klank-named-ports routes + supervised caddy) for %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%i
+Group=%i
+# HOME is set by systemd; the daemon defaults to $HOME/.klank/klank.db
+# and $HOME/.klank/Caddyfile (dashboard written next to it).
+# Domain override if you don't want .klank.localhost:
+#Environment=KLANK_PROXY_DOMAIN=klank.localhost
+# keep caddy's own state (storage, autosave) inside ~/.klank too:
+Environment=XDG_DATA_HOME=%h/.klank/caddy-data
+Environment=XDG_CONFIG_HOME=%h/.klank/caddy-config
+ExecStart=/usr/local/bin/klank-proxy-watcher
+Restart=on-failure
+RestartSec=2
+
+# caddy (child process) binds ports 80/443; ambient capabilities are
+# inherited across exec, so the watcher itself needs no privileges.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+# --- hardening -----------------------------------------------------------
+# daemon needs: read ~/.klank/klank.db (+ wal/shm siblings), write the
+# generated files into ~/.klank, and exec caddy which reads the same
+# directory
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+# NOTE: if you point the daemon at a different directory via -f, add
+# that path to ReadWritePaths above.
+
+[Install]
+WantedBy=multi-user.target
