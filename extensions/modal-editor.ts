@@ -93,10 +93,29 @@ export class VimEditor extends CustomEditor {
 		this.redoStack.length = 0; // new edits invalidate redo history
 	}
 
-	/** Called by the escape-while-scrolled terminal-input hook: force insert mode. */
-	enterInsertExternal(): void {
+/** Called by the escape-while-scrolled terminal-input hook: force insert mode. */
+enterInsertExternal(): void {
+	this.enterInsert();
+}
+
+/** True when the input has no text on any line. */
+private inputEmpty(): boolean {
+	return this.lines().every((l) => l.length === 0);
+}
+
+/** Model started working: flip the label off READY (re-render if visible). */
+onAgentStart(): void {
+	this.int.tui.requestRender?.();
+}
+
+/** Model finished: auto-enter insert mode (so READY shows for an empty
+ * input) unless the user is scrolled up reading the transcript. */
+onAgentEnd(): void {
+	if (activeTui?.isFollowingOutput !== false) {
 		this.enterInsert();
 	}
+	this.int.tui.requestRender?.();
+}
 
 	private setMode(mode: "normal" | "insert"): void {
 		this.mode = mode;
@@ -906,31 +925,37 @@ export class VimEditor extends CustomEditor {
 	// Mode indicator (start of the prompt line)
 	// ------------------------------------------------------------------
 
-	/** Mode label: NORMAL / INSERT / pending operator ("2d3").
-	 * All states are padded to a constant width (NORMAL/INSERT are the widest
-	 * at 8 cols, " 9d9 " fits inside), so the prompt text never shifts.
-	 * Style: bold black text on a colored background (theme accent colors). */
-	private modeLabel(): string {
-		const LABEL_WIDTH = " NORMAL ".length;
-		const padTo = (s: string): string => s + " ".repeat(Math.max(0, LABEL_WIDTH - visibleWidth(s)));
-		const theme = fullThemeRef?.ui?.theme as
-			| {
-					style?: (text: string, options: Record<string, unknown>) => string;
-					colors?: Record<string, unknown>;
-				}
-			| undefined;
-		const styled = (text: string, token: string): string => {
-			const bgColor = theme?.colors?.[token];
-			if (typeof theme?.style === "function" && bgColor) {
-				// Black as a concrete rgb Color (strings would be theme token names);
-				// bg = a theme color token so the label actually has color.
-				return theme.style(text, { fg: { kind: "rgb", r: 0, g: 0, b: 0 }, bg: bgColor, bold: true });
+/** Mode label: READY / NORMAL / INSERT / pending operator ("2d3").
+ * All states are padded to a constant width (NORMAL/INSERT are the widest
+ * at 8 cols, " 9d9 " fits inside), so the prompt text never shifts.
+ * Style: bold black text on a colored background (theme accent colors, or
+ * concrete rgb for READY/NORMAL which have no theme tokens). */
+private modeLabel(): string {
+	const LABEL_WIDTH = " NORMAL ".length;
+	const padTo = (s: string): string => s + " ".repeat(Math.max(0, LABEL_WIDTH - visibleWidth(s)));
+	const theme = fullThemeRef?.ui?.theme as
+		| {
+				style?: (text: string, options: Record<string, unknown>) => string;
+				colors?: Record<string, unknown>;
 			}
-			return text;
-		};
-		if (this.mode === "insert") {
-			return padTo(styled(" INSERT ", "success"));
+		| undefined;
+	const styled = (text: string, color: string | { kind: "rgb"; r: number; g: number; b: number }): string => {
+		// A token name resolves through the theme; a concrete rgb Color is used
+		// as-is. Black fg as a concrete rgb Color (strings would be token names).
+		const bgColor = typeof color === "string" ? theme?.colors?.[color] : color;
+		if (typeof theme?.style === "function" && bgColor) {
+			return theme.style(text, { fg: { kind: "rgb", r: 0, g: 0, b: 0 }, bg: bgColor, bold: true });
 		}
+		return text;
+	};
+	if (this.mode === "insert") {
+		// READY: idle model + empty input, i.e. "waiting for your follow-up" —
+		// visible from across the room. Behaviorally it is still insert mode.
+		if (!agentRunning && this.inputEmpty()) {
+			return padTo(styled(" READY ", { kind: "rgb", r: 255, g: 105, b: 180 }));
+		}
+		return padTo(styled(" INSERT ", "success"));
+	}
 		if (this.op) {
 			// vim showcmd style: "2d3" (count typed before op, op, count after op)
 			const cnt =
@@ -939,7 +964,7 @@ export class VimEditor extends CustomEditor {
 				(this.count2 === null ? "" : String(this.count2));
 			return padTo(styled(` ${cnt} `, "warning"));
 		}
-		return padTo(styled(" NORMAL ", "accent"));
+		return padTo(styled(" NORMAL ", { kind: "rgb", r: 212, g: 160, b: 0 }));
 	}
 
 	/** Prepend the mode label + one plain space to the first prompt line, before the text/cursor. */
@@ -965,6 +990,11 @@ let fullThemeRef: any = undefined;
 let activeEditor: VimEditor | undefined;
 let activeTui: any = undefined;
 let unsubscribeInput: (() => void) | undefined;
+/** True while the model is working; drives the READY label. */
+let agentRunning = false;
+/** agent_start/agent_end are registered once per extension load (not per
+ * session_start) so /reload or /new-session cannot stack duplicate handlers. */
+let agentEventsRegistered = false;
 
 export default function (pi: ExtensionAPI) {
 	pi.on("session_start", (_event, ctx) => {
@@ -995,6 +1025,21 @@ export default function (pi: ExtensionAPI) {
 			return { consume: true };
 		});
 	});
+
+	// Track the model's busy state for the READY label, and auto-enter insert
+	// mode when a task finishes (unless the user is scrolled up in the
+	// transcript — then respect their reading position; the label still flips).
+	if (!agentEventsRegistered) {
+		agentEventsRegistered = true;
+		pi.on("agent_start", () => {
+			agentRunning = true;
+			activeEditor?.onAgentStart();
+		});
+		pi.on("agent_end", () => {
+			agentRunning = false;
+			activeEditor?.onAgentEnd();
+		});
+	}
 	pi.on("session_end", () => {
 		// restore a sane cursor shape if pi exits while in insert mode
 		process.stdout.write("\x1b[2 q");
