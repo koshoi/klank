@@ -51,9 +51,17 @@ COPY extensions/subagents /opt/pi-agent/extensions/subagents/
 COPY extensions/subagents/agents/ /opt/pi-agent/agents/
 COPY extensions/subagents/prompts/ /opt/pi-agent/prompts/
 
+# modal editor extension: vim-style modal editing (normal/insert modes,
+# hjkl navigation, mode indicator on the editor border)
+COPY extensions/modal-editor.ts /opt/pi-agent/extensions/modal-editor.ts
+
 # user-borders extension: ASCII rules around user messages (keeps prompts
 # visually distinct from model output on color-poor terminals)
 COPY extensions/user-borders.ts /opt/pi-agent/extensions/user-borders.ts
+
+# keybindings: up/down arrows scroll the transcript instead of browsing
+# prompt history (fullscreen TUI mode)
+COPY keybindings.json /opt/pi-agent/keybindings.json
 
 # system-prompt addendum: appended to pi's system prompt
 COPY APPEND_SYSTEM.md /opt/pi-agent/APPEND_SYSTEM.md

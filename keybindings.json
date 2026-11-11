@@ -1,0 +1,5 @@
+{
+  "$schema": "https://pi.dev/schemas/keybindings.schema.json",
+  "tui.altScreen.lineUp": "up",
+  "tui.altScreen.lineDown": "down"
+}
