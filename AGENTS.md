@@ -38,6 +38,20 @@ Because of this:
 - When changing harness behavior, change it **here** (extensions /
   bridge / image), not by hand-patching the installed pi package at runtime.
   Runtime patches vanish when the container is rebuilt.
+- The running pi session does **not** load extensions from this repo — they
+  are baked into the image at **`/opt/pi-agent/extensions/`** (the agent dir
+  is pinned via `PI_CODING_AGENT_DIR`). To make an extension change testable
+  in the **current** session, apply every extension edit to **both** places:
+
+  1. edit the source in `extensions/` (the durable change), and
+  2. copy it over the live copy, e.g.
+     `sudo cp extensions/foo.ts /opt/pi-agent/extensions/foo.ts`
+     (`/opt/pi-agent` is chmod'd a+rwX at build time, but files are owned by
+     root, so use `sudo`).
+
+  Then `/reload` inside pi picks the new code up in the same session. The
+  runtime copy is ephemeral; the next image build takes the `extensions/`
+  source automatically.
 
 ## Porting from omp
 

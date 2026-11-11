@@ -93,6 +93,11 @@ export class VimEditor extends CustomEditor {
 		this.redoStack.length = 0; // new edits invalidate redo history
 	}
 
+	/** Called by the escape-while-scrolled terminal-input hook: force insert mode. */
+	enterInsertExternal(): void {
+		this.enterInsert();
+	}
+
 	private setMode(mode: "normal" | "insert"): void {
 		this.mode = mode;
 		this.count1 = null;
@@ -955,10 +960,40 @@ export class VimEditor extends CustomEditor {
  * ctx.ui.theme (the factory only receives the reduced editor theme). */
 let fullThemeRef: any = undefined;
 
+/** Live editor + tui refs, stashed by the editor factory so the terminal-input
+ * hook below can scroll to the end and force insert mode. */
+let activeEditor: VimEditor | undefined;
+let activeTui: any = undefined;
+let unsubscribeInput: (() => void) | undefined;
+
 export default function (pi: ExtensionAPI) {
 	pi.on("session_start", (_event, ctx) => {
 		fullThemeRef = ctx;
-		ctx.ui.setEditorComponent((tui, theme, kb) => new VimEditor(tui, theme, kb));
+		ctx.ui.setEditorComponent((tui, theme, kb) => {
+			const editor = new VimEditor(tui, theme, kb);
+			activeEditor = editor;
+			activeTui = tui;
+			return editor;
+		});
+
+		// Escape while the transcript is scrolled up: jump to the end and enter
+		// insert mode instead of aborting the running prompt. Runs as a terminal
+		// input listener, i.e. before the editor/app interrupt handling sees the key.
+		unsubscribeInput?.();
+		unsubscribeInput = ctx.ui.onTerminalInput((data) => {
+			if (!matchesKey(data, "escape")) return undefined;
+			const tui = activeTui;
+			const editor = activeEditor;
+			if (!tui || !editor) return undefined;
+			// Only while scrolled up in the transcript (fullscreen follow disabled).
+			if (tui.isFollowingOutput !== false) return undefined;
+			// Let escape cancel an open autocomplete menu / overlay dialog first.
+			if (editor.isShowingAutocomplete()) return undefined;
+			if (Array.isArray(tui.overlayStack) && tui.overlayStack.length > 0) return undefined;
+			tui.scrollToBottom();
+			editor.enterInsertExternal();
+			return { consume: true };
+		});
 	});
 	pi.on("session_end", () => {
 		// restore a sane cursor shape if pi exits while in insert mode
