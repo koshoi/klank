@@ -948,13 +948,18 @@ private modeLabel(): string {
 		}
 		return text;
 	};
+	// Pad the PLAIN text first, then style the whole padded string: every branch
+	// renders to exactly LABEL_WIDTH columns by construction, and the background
+	// covers the full label (no unstylened trailing pad column to shift text).
+	const label = (text: string, color: string | { kind: "rgb"; r: number; g: number; b: number }): string =>
+		styled(padTo(text), color);
 	if (this.mode === "insert") {
 		// READY: idle model + empty input, i.e. "waiting for your follow-up" —
 		// visible from across the room. Behaviorally it is still insert mode.
 		if (!agentRunning && this.inputEmpty()) {
-			return padTo(styled(" READY ", { kind: "rgb", r: 255, g: 105, b: 180 }));
+			return label(" READY ", { kind: "rgb", r: 255, g: 105, b: 180 });
 		}
-		return padTo(styled(" INSERT ", "success"));
+		return label(" INSERT ", "success");
 	}
 		if (this.op) {
 			// vim showcmd style: "2d3" (count typed before op, op, count after op)
@@ -962,9 +967,9 @@ private modeLabel(): string {
 				(this.count1 === null ? "" : String(this.count1)) +
 				this.op +
 				(this.count2 === null ? "" : String(this.count2));
-			return padTo(styled(` ${cnt} `, "warning"));
+			return label(` ${cnt} `, "warning");
 		}
-		return padTo(styled(" NORMAL ", { kind: "rgb", r: 212, g: 160, b: 0 }));
+		return label(" NORMAL ", { kind: "rgb", r: 212, g: 160, b: 0 });
 	}
 
 	/** Prepend the mode label + one plain space to the first prompt line, before the text/cursor. */
