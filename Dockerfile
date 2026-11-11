@@ -5,14 +5,19 @@ RUN apt-get update \
   && rm -rf /var/lib/apt/lists/*
 
 # fd: bake in the same static musl binary pi's tools-manager would download
-# (sharkdp/fd GitHub release). Resolve the latest version the same way pi does
-# — via the /releases/latest redirect, avoiding the rate-limited api.github.com.
+# (sharkdp/fd GitHub release). Resolve the latest version via the GitHub API.
+# (The old /releases/latest redirect trick no longer works: GitHub now serves
+# that page with 200 instead of 302, so %{redirect_url} comes back empty.)
 # Placed in pi's own tools dir ($PI_CODING_AGENT_DIR/bin/fd), which pi checks
 # before PATH, so it never re-downloads at session start.
 RUN set -eux; \
   mkdir -p /opt/pi-agent/bin; \
-  ver="$(curl -fsSL -o /dev/null -w '%{redirect_url}' https://github.com/sharkdp/fd/releases/latest \
-        | sed 's|.*/tag/v||')"; \
+  ver="$(curl -fsSL https://api.github.com/repos/sharkdp/fd/releases/latest \
+        | jq -r '.tag_name // empty | sub("^v";"")')"; \
+  if [ -z "${ver}" ]; then \
+    ver="$(curl -fsSL -o /dev/null -w '%{redirect_url}' https://github.com/sharkdp/fd/releases/latest \
+          | sed 's|.*/tag/v||')"; \
+  fi; \
   echo "fd version: ${ver}"; \
   curl -fsSL "https://github.com/sharkdp/fd/releases/download/v${ver}/fd-v${ver}-x86_64-unknown-linux-musl.tar.gz" \
     | tar -xz -C /opt/pi-agent/bin --strip-components=1 "fd-v${ver}-x86_64-unknown-linux-musl/fd"; \
