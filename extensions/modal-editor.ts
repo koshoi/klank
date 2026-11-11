@@ -36,7 +36,6 @@ function charClass(ch: string | undefined): "word" | "space" | "punct" {
 
 export class VimEditor extends CustomEditor {
 	private mode: "normal" | "insert" = "insert";
-	private themeObj: { fg: (name: string, text: string) => string };
 	private count1: number | null = null; // count typed before operator
 	private count2: number | null = null; // count typed after operator
 	private op: "d" | "c" | "y" | null = null;
@@ -49,7 +48,6 @@ export class VimEditor extends CustomEditor {
 
 	constructor(...args: ConstructorParameters<typeof CustomEditor>) {
 		super(...args);
-		this.themeObj = args[1] as unknown as { fg: (name: string, text: string) => string };
 	}
 
 	// --- access to Editor internals that are TS-private but runtime-stable ---
@@ -891,13 +889,25 @@ export class VimEditor extends CustomEditor {
 
 	protected override renderTopBorder(width: number, hiddenLineCount: number): string {
 		const base = super.renderTopBorder(width, hiddenLineCount);
+		// pi passes the editor factory a reduced theme ({ borderColor, selectList })
+		// with no .fg(); the full theme is ctx.ui.theme (live getter, always current).
+		const theme = fullThemeRef?.ui?.theme as
+			| { fg?: (name: string, text: string) => string }
+			| undefined;
+		const fg = (name: string, text: string): string =>
+			typeof theme?.fg === "function" ? theme.fg(name, text) : text;
 		let label: string;
 		if (this.mode === "insert") {
-			label = this.themeObj.fg("success", " INSERT ");
+			label = fg("success", " INSERT ");
 		} else if (this.op) {
-			label = this.themeObj.fg("warning", ` ${this.op}${this.count1 ?? ""}·PENDING `);
+			// vim showcmd style: "2d3" (count typed before op, op, count after op)
+			const cnt =
+				(this.count1 === null ? "" : String(this.count1)) +
+				this.op +
+				(this.count2 === null ? "" : String(this.count2));
+			label = fg("warning", ` ${cnt}·PENDING `);
 		} else {
-			label = this.themeObj.fg("accent", " NORMAL ");
+			label = fg("accent", " NORMAL ");
 		}
 		if (visibleWidth(base) >= visibleWidth(label)) {
 			return truncateToWidth(base, width - visibleWidth(label), "") + label;
@@ -906,8 +916,13 @@ export class VimEditor extends CustomEditor {
 	}
 }
 
+/** Live ExtensionContext, stashed on session_start so the editor can reach
+ * ctx.ui.theme (the factory only receives the reduced editor theme). */
+let fullThemeRef: any = undefined;
+
 export default function (pi: ExtensionAPI) {
 	pi.on("session_start", (_event, ctx) => {
+		fullThemeRef = ctx;
 		ctx.ui.setEditorComponent((tui, theme, kb) => new VimEditor(tui, theme, kb));
 	});
 	pi.on("session_end", () => {
