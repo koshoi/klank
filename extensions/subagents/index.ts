@@ -27,7 +27,7 @@ import {
 	getMarkdownTheme,
 	withFileMutationQueue,
 } from "@earendil-works/pi-coding-agent";
-import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
+import { Container, Markdown, Spacer, Text, type AutocompleteItem } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
 
@@ -35,6 +35,173 @@ const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
 const COLLAPSED_ITEM_COUNT = 10;
 const PER_TASK_OUTPUT_CAP = 50 * 1024;
+const BG_OUTPUT_CAP = 4 * 1024;
+const MAX_COMPLETED_HISTORY = 20;
+
+type BackgroundNotify = "steer" | "followUp";
+
+interface BackgroundTask {
+	id: string;
+	agent: string;
+	task: string;
+	startedAt: number;
+	notify: BackgroundNotify;
+	// Aborting this kills the spawned pi process (SIGTERM ladder inside
+	// runSingleAgent); used on session shutdown and by /task-cancel.
+	cancel: AbortController;
+	promise: Promise<SingleResult>;
+}
+
+interface CompletedBackgroundTask {
+	id: string;
+	agent: string;
+	task: string;
+	startedAt: number;
+	completedAt: number;
+	notify: BackgroundNotify;
+	failed: boolean;
+}
+
+// Module-level registry of running background tasks (id -> task)
+const runningBackgroundTasks = new Map<string, BackgroundTask>();
+// Ring of recently-completed background tasks for the /tasks listing
+const completedBackgroundTasks: CompletedBackgroundTask[] = [];
+let backgroundTaskCounter = 0;
+
+function formatDuration(ms: number): string {
+	const seconds = ms / 1000;
+	if (seconds < 60) return `${seconds.toFixed(1)}s`;
+	return `${Math.floor(seconds / 60)}m ${Math.round(seconds % 60)}s`;
+}
+
+function truncateBackgroundOutput(output: string): string {
+	const byteLength = Buffer.byteLength(output, "utf8");
+	if (byteLength <= BG_OUTPUT_CAP) return output;
+
+	let truncated = output.slice(0, BG_OUTPUT_CAP);
+	while (Buffer.byteLength(truncated, "utf8") > BG_OUTPUT_CAP) {
+		truncated = truncated.slice(0, -1);
+	}
+	return `${truncated}\n\n[Output truncated: ${byteLength - Buffer.byteLength(truncated, "utf8")} bytes omitted.]`;
+}
+
+interface BackgroundTaskOptions {
+	defaultCwd: string;
+	runCwd: string | undefined;
+	dispatchDefaults: DispatchDefaults;
+	agents: AgentConfig[];
+	agentScope: AgentScope;
+	projectAgentsDir: string | null;
+	agentName: string;
+	task: string;
+	notify: BackgroundNotify;
+}
+
+// Spawn a subagent without awaiting it: the child runs in the background and
+// its result is delivered to the session via a custom message on completion.
+function startBackgroundTask(pi: ExtensionAPI, options: BackgroundTaskOptions): BackgroundTask {
+	const { defaultCwd, runCwd, dispatchDefaults, agents, agentScope, projectAgentsDir, agentName, task, notify } =
+		options;
+	backgroundTaskCounter++;
+	const id = `t-${String(backgroundTaskCounter).padStart(4, "0")}`;
+
+	const makeDetails = (results: SingleResult[]): SubagentDetails => ({
+		mode: "single",
+		agentScope,
+		projectAgentsDir,
+		results,
+	});
+
+	const cancel = new AbortController();
+
+	const entry: BackgroundTask = {
+		id,
+		agent: agentName,
+		task,
+		startedAt: Date.now(),
+		notify,
+		cancel,
+		promise: runSingleAgent(
+			defaultCwd,
+			dispatchDefaults,
+			agents,
+			agentName,
+			task,
+			runCwd,
+			undefined,
+			cancel.signal,
+			undefined,
+			makeDetails,
+		),
+	};
+	runningBackgroundTasks.set(id, entry);
+
+	void entry.promise.then(
+		(result) => deliverBackgroundResult(pi, entry, result),
+		(error) => {
+			const failed: SingleResult = {
+				agent: agentName,
+				agentSource: "unknown",
+				task,
+				exitCode: 1,
+				messages: [],
+				stderr: error instanceof Error ? (error.stack || error.message) : String(error),
+				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+			};
+			deliverBackgroundResult(pi, entry, failed);
+		},
+	);
+
+	return entry;
+}
+
+function deliverBackgroundResult(pi: ExtensionAPI, entry: BackgroundTask, result: SingleResult): void {
+	// Everything below runs on a floating promise chain (no attached handler
+	// for its rejection), so any throw here would surface as an
+	// unhandledRejection and crash the session. Contain it all.
+	try {
+		const completedAt = Date.now();
+		const failed = isFailedResult(result);
+
+		completedBackgroundTasks.push({
+			id: entry.id,
+			agent: entry.agent,
+			task: entry.task,
+			startedAt: entry.startedAt,
+			completedAt,
+			notify: entry.notify,
+			failed,
+		});
+		if (completedBackgroundTasks.length > MAX_COMPLETED_HISTORY) {
+			completedBackgroundTasks.splice(0, completedBackgroundTasks.length - MAX_COMPLETED_HISTORY);
+		}
+		runningBackgroundTasks.delete(entry.id);
+
+		const elapsed = formatDuration(completedAt - entry.startedAt);
+		const outcome = failed ? "failed" : "completed";
+		const output = truncateBackgroundOutput(getResultOutput(result));
+
+		pi.sendMessage(
+			{
+				customType: "subagent-result",
+				content: `Background task ${entry.id} (${entry.agent}) ${outcome} in ${elapsed}: ${output}`,
+				display: true,
+				details: { taskId: entry.id, agent: entry.agent, exitCode: result.exitCode, usage: result.usage },
+			},
+			{
+				deliverAs: entry.notify,
+				triggerTurn: true,
+			},
+		);
+	} catch {
+		// bookkeeping/delivery failure must never crash the extension
+	}
+}
+
+function previewTask(task: string, max = 60): string {
+	const singleLine = task.replace(/\s+/g, " ").trim();
+	return singleLine.length > max ? `${singleLine.slice(0, max)}...` : singleLine;
+}
 
 function formatTokens(count: number): string {
 	if (count < 1000) return count.toString();
@@ -468,9 +635,27 @@ const SubagentParams = Type.Object({
 		Type.Boolean({ description: "Prompt before running project-local agents. Default: true.", default: true }),
 	),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process (single mode)" })),
+	background: Type.Optional(
+		Type.Object({
+			notify: Type.Optional(
+				StringEnum(["steer", "followUp"] as const, {
+					description: 'How to deliver the result when it completes. Default: "steer".',
+				}),
+			),
+		}),
+	),
 });
 
 export default function (pi: ExtensionAPI) {
+	// Kill every running background task on shutdown (quit, reload,
+	// new-session, resume, fork) so their spawned pi processes do not
+	// outlive the session as token-burning orphans.
+	pi.on("session_shutdown", () => {
+		for (const task of runningBackgroundTasks.values()) {
+			task.cancel.abort();
+		}
+	});
+
 	pi.registerTool({
 		name: "subagent",
 		label: "Subagent",
@@ -688,6 +873,41 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (params.agent && params.task) {
+				if (params.background) {
+					if (runningBackgroundTasks.size >= MAX_PARALLEL_TASKS) {
+						return {
+							content: [
+								{
+									type: "text",
+									text: `Too many running background tasks (max ${MAX_PARALLEL_TASKS}). Wait for one to complete, or cancel one with /task-cancel.`,
+								},
+							],
+							details: makeDetails("single")([]),
+						};
+					}
+					const entry = startBackgroundTask(pi, {
+						defaultCwd: ctx.cwd,
+						runCwd: params.cwd,
+						dispatchDefaults,
+						agents,
+						agentScope,
+						projectAgentsDir: discovery.projectAgentsDir,
+						agentName: params.agent,
+						// StringEnum does not narrow the static type here (it infers {}),
+						// so the cast is load-bearing for tsc --strict.
+						task: params.task,
+						notify: (params.background.notify as BackgroundNotify | undefined) ?? "steer",
+					});
+					return {
+						content: [
+							{
+								type: "text",
+								text: `Background task ${entry.id} started (agent: ${entry.agent}). Result will be delivered when it completes.`,
+							},
+						],
+						details: makeDetails("single")([]),
+					};
+				}
 				const result = await runSingleAgent(
 					ctx.cwd,
 					dispatchDefaults,
@@ -1033,8 +1253,113 @@ export default function (pi: ExtensionAPI) {
 				return new Text(text, 0, 0);
 			}
 
-			const text = result.content[0];
-			return new Text(text?.type === "text" ? text.text : "(no output)", 0, 0);
+				const text = result.content[0];
+				return new Text(text?.type === "text" ? text.text : "(no output)", 0, 0);
+			},
+		});
+
+	// argumentHint is not forwarded for extension commands by the TUI (only
+	// getArgumentCompletions is), so we offer agent-name completions instead.
+	pi.registerCommand("task", {
+		description: "Start a background subagent task ([agent:]task description)",
+		getArgumentCompletions: (prefix) => {
+			if (prefix.includes(":")) return null;
+			const agents = discoverAgents(process.cwd(), "user").agents;
+			const items: AutocompleteItem[] = agents
+				.filter((a) => `${a.name}:`.startsWith(prefix))
+				.map((a) => ({ value: `${a.name}:`, label: a.name, description: "agent" }));
+			return items.length > 0 ? items : null;
+		},
+		handler: async (args, ctx) => {
+			const input = args.trim();
+			if (!input) {
+				ctx.ui.notify("Usage: /task [agent:]task description", "warning");
+				return;
+			}
+
+			const agentScope: AgentScope = "user";
+			const discovery = discoverAgents(ctx.cwd, agentScope);
+			const agents = discovery.agents;
+
+			let agentName = "worker";
+			let taskText = input;
+			const match = input.match(/^(\S+):([\s\S]*)$/);
+			if (match && agents.some((a) => a.name === match[1])) {
+				agentName = match[1];
+				taskText = match[2].trim();
+			}
+
+			if (!taskText) {
+				ctx.ui.notify(`No task text after "${agentName}:". Usage: /task [agent:]task description`, "warning");
+				return;
+			}
+
+			if (!agents.some((a) => a.name === agentName)) {
+				const available = agents.map((a) => a.name).join(", ") || "none";
+				ctx.ui.notify(`Unknown agent "${agentName}". Available agents: ${available}`, "warning");
+				return;
+			}
+
+			if (runningBackgroundTasks.size >= MAX_PARALLEL_TASKS) {
+				ctx.ui.notify(
+					`Too many running background tasks (max ${MAX_PARALLEL_TASKS}). Cancel one with /task-cancel.`,
+					"warning",
+				);
+				return;
+			}
+
+			const dispatchDefaults: DispatchDefaults = {
+				model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined,
+				thinkingLevel: ctx.thinkingLevel,
+			};
+
+			const entry = startBackgroundTask(pi, {
+				defaultCwd: ctx.cwd,
+				runCwd: undefined,
+				dispatchDefaults,
+				agents,
+				agentScope,
+				projectAgentsDir: discovery.projectAgentsDir,
+				agentName,
+				task: taskText,
+				notify: "steer",
+			});
+			ctx.ui.notify(`Task ${entry.id} started (${entry.agent}, background)`, "info");
+		},
+	});
+
+	pi.registerCommand("task-cancel", {
+		description: "Cancel a running background subagent task (/task-cancel <id>)",
+		handler: async (args, ctx) => {
+			const id = args.trim();
+			const task = id ? runningBackgroundTasks.get(id) : undefined;
+			if (!task) {
+				const running = Array.from(runningBackgroundTasks.keys()).join(", ") || "none";
+				ctx.ui.notify(`No running background task "${id || "(none given)"}". Running: ${running}`, "warning");
+				return;
+			}
+			task.cancel.abort();
+			ctx.ui.notify(`Canceling ${task.id} (${task.agent})`, "info");
+		},
+	});
+
+	pi.registerCommand("tasks", {
+		description: "List background subagent tasks",
+		handler: async (_args, ctx) => {
+			const now = Date.now();
+			const lines: string[] = [];
+			for (const entry of runningBackgroundTasks.values()) {
+				lines.push(
+					`${entry.id}  ${entry.agent}  running ${formatDuration(now - entry.startedAt)}  ${previewTask(entry.task)}  (notify: ${entry.notify})`,
+				);
+			}
+			for (const c of completedBackgroundTasks) {
+				const status = c.failed ? "failed" : "completed";
+				lines.push(
+					`${c.id}  ${c.agent}  ${status} in ${formatDuration(c.completedAt - c.startedAt)}  ${formatDuration(now - c.completedAt)} ago  ${previewTask(c.task)}`,
+				);
+			}
+			ctx.ui.notify(lines.length > 0 ? lines.join("\n") : "No background tasks", "info");
 		},
 	});
 }
