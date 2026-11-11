@@ -83,7 +83,8 @@ The container entrypoint:
   For compatibility with older klank binaries the legacy file spool
   `/tmp/pi-inbox` is still watched: any `msg-<id>` file dropped there is
   removed and injected exactly like `POST /message`.
-- **`extensions/edit-guard.ts`** — snapshot-based edit guardrails: tracks a
+- **`extensions/edit-guard.ts`** — snapshot-based edit guardrails (partly
+  inspired by omp's hashline editing + stale-tag reveal): tracks a
   content hash of every file the model has read and blocks `edit`/`write`
   calls against files that changed since (catching out-of-band mutations),
   intercepts edit-shaped shell commands (`sed -i`, redirects, …) and points
@@ -97,7 +98,10 @@ The container entrypoint:
   `hashline-read.ts` prints in read output, so reads, guard messages and
   snapshots all reference one fingerprint.
 - **`extensions/hashline-read.ts`** — overrides the built-in `read` tool with
-  an omp hashline-style output format: text reads start with a
+  an omp hashline-style output format (inspired by the omp / Oh My Pi
+  harness, https://github.com/can1357/oh-my-pi — same `[path#TAG]` header
+  and numbered-line scheme as omp's read tool, simplified for pi's exact-
+  match `edit` tool, which cannot consume tags): text reads start with a
   `[path#TAG]` header (TAG is a 4-hex content fingerprint shared with
   edit-guard — quote it when reporting file state) and every line is
   `N:`-prefixed with its 1-based source line number, stable across

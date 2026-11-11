@@ -1,6 +1,12 @@
 /**
  * hashline.ts - omp-style hashline formatting primitives (pure, no pi imports).
  *
+ * Inspired by the omp (Oh My Pi) coding-agent harness's read format
+ * (https://github.com/can1357/oh-my-pi — packages/tui/src/tools/hashline-format.ts):
+ * a `[path#TAG]` content-hash header plus 1-based numbered lines. Simplified
+ * for pi: the tag is display-only (pi's edit tool matches exact oldText and
+ * does not consume tags), and no native hashing is involved.
+ *
  * The 4-hex `TAG` in a read header (`[path#TAG]`) is a content fingerprint of
  * the file as it was read: the first 4 uppercase hex digits of sha256 over the
  * BOM-stripped, CRLF→LF-normalized text. edit-guard's 8-hex snapshot hash is
