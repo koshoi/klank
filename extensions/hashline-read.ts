@@ -56,7 +56,7 @@ export const resolveReadPath = (filePath: string, cwd: string): string => {
 const BOM_STRIP = (s: string): string => (s.charCodeAt(0) === 0xfeff ? s.slice(1) : s);
 
 const DESCRIPTION_EXTENSION =
-	" Output starts with a [path#TAG] header, where TAG is a 4-hex fingerprint of the file as read — quote it when reporting file state. Every line is N:-prefixed for reference only; the edit tool requires exact oldText matching, never line numbers or :N selectors. Continuation works via offset=N exactly as the notices say.";
+	" Output format: `[path#TAG]` header (TAG is a 4-hex fingerprint of the file as read — quote it when reporting file state), then `N:<verbatim file content>` per line. Everything after `N:` is exact file text including indentation (tabs vs spaces) — to edit, strip only the `N:` prefix and reproduce the rest byte-for-byte in oldText; never line numbers or :N selectors. Continuation works via offset=N exactly as the notices say.";
 
 export default function (pi: ExtensionAPI) {
 	// The built-in definition supplies the schema, output schema, prompt

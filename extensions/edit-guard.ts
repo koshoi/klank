@@ -260,7 +260,9 @@ export default function (pi: ExtensionAPI) {
 		"message says the file changed, use the shown region diff to fix up your " +
 		"change and retry — re-read (offset/limit) only when you need more context. " +
 		"read output starts with [path#TAG] — quote the tag when reporting file state; " +
-		"line numbers are informational, edit with exact oldText only.</critical>";
+		"line numbers are informational, edit with exact oldText only — content after the " +
+		"N: prefix is verbatim file text including indentation; reproduce tabs/spaces " +
+		"byte-for-byte.</critical>";
 
 	// Layer 4: tool-discipline rule in the system prompt
 	pi.on("before_agent_start", async (event) => {
