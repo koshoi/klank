@@ -17,7 +17,7 @@ caddy service to install or manage. One process is the entire deployment.
 Klank records every named port (`klank new -p name=container-port`) in
 `~/.klank/klank.db` (`agents` table, JSON `ports` column). The daemon:
 
-1. polls that database read-only every 2s and regenerates, next to the
+1. polls that database read-only every 750ms and regenerates, next to the
    Caddyfile:
    - the **Caddyfile** — one `http://<port-name>.<agent>.<domain>`
      reverse-proxy site block per route, plus a dashboard site block
@@ -63,7 +63,7 @@ under a wrapper that grants `CAP_NET_BIND_SERVICE`.
 Flags (see `-h`): `-i` poll interval, `-f` Caddyfile path (dashboard
 files are written next to it), `-d` domain suffix, `-caddy` path to
 the caddy binary, `-db` database path, `--once` (sync once, no caddy).
-Defaults: poll 2s, `~/.klank/Caddyfile`, domain from
+Defaults: poll 750ms, `~/.klank/Caddyfile`, domain from
 `$KLANK_PROXY_DOMAIN` or `klank.localhost`.
 
 ### Running under sudo

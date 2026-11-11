@@ -56,7 +56,7 @@ func main() {
 	log.SetFlags(log.LstdFlags)
 	log.SetPrefix("klankd: ")
 
-	interval := flag.Duration("i", 2*time.Second, "poll interval (min 250ms)")
+	interval := flag.Duration("i", 750*time.Millisecond, "poll interval (min 250ms)")
 	file := flag.String("f", "", "Caddyfile path; the dashboard (index.html, klank-agents.json) is written next to it (default ~/.klank/Caddyfile)")
 	domain := flag.String("d", "", "domain suffix (default $KLANK_PROXY_DOMAIN or \"klank.localhost\"); the dashboard is served at the domain itself")
 	caddyBin := flag.String("caddy", "caddy", "path to the caddy binary to supervise")
