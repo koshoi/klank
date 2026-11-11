@@ -22,28 +22,41 @@ RUN apt-get update \
   && chmod 0440 /etc/sudoers.d/all-users \
   && rm -rf /var/lib/apt/lists/*
 
+# pi agent dir, pinned so config can be baked in at build time.
+# Readable/writable by any runtime user (auth.json, settings.json, sessions
+# are written here at startup).
+# NOTE: single-user image -- do not rely on /opt/pi-agent for isolation
+# between container users.
+ENV PI_CODING_AGENT_DIR=/opt/pi-agent
+RUN mkdir -p /opt/pi-agent/extensions && chmod -R a+rwX /opt/pi-agent
+
 # klank bridge extension: lets `klank send` inject user messages into a
-# running pi TUI session (the entrypoint installs it into the extensions dir)
-COPY klank/bridge.ts /opt/pi-bridge/bridge.ts
+# running pi TUI session
+COPY klank/bridge.ts /opt/pi-agent/extensions/bridge.ts
 
 # edit-guard extension: snapshot-based edit guardrails (staleness detection,
-# bash intent interceptor) — installed into the extensions dir by the entrypoint
-COPY extensions/edit-guard.ts /opt/pi-bridge/edit-guard.ts
+# bash intent interceptor)
+COPY extensions/edit-guard.ts /opt/pi-agent/extensions/edit-guard.ts
 
 # hashline extensions: shared fingerprint primitives + the `read` override
 # that emits [path#TAG] headers and N:-numbered lines (edit-guard.ts imports
 # ./hashline.ts, so both must be installed alongside it)
-COPY extensions/hashline.ts /opt/pi-bridge/hashline.ts
-COPY extensions/hashline-read.ts /opt/pi-bridge/hashline-read.ts
+COPY extensions/hashline.ts /opt/pi-agent/extensions/hashline.ts
+COPY extensions/hashline-read.ts /opt/pi-agent/extensions/hashline-read.ts
 
 # subagents extension: task delegation to isolated `pi` subprocesses
-# (single/parallel/chain modes, agents defined as markdown frontmatter) —
-# installed into the extensions dir by the entrypoint
-COPY extensions/subagents /opt/pi-bridge/subagents/
+# (single/parallel/chain modes, agents defined as markdown frontmatter);
+# its agent defs and prompt templates go into the agent dir too
+COPY extensions/subagents /opt/pi-agent/extensions/subagents/
+COPY extensions/subagents/agents/ /opt/pi-agent/agents/
+COPY extensions/subagents/prompts/ /opt/pi-agent/prompts/
 
 # user-borders extension: ASCII rules around user messages (keeps prompts
 # visually distinct from model output on color-poor terminals)
-COPY extensions/user-borders.ts /opt/pi-bridge/user-borders.ts
+COPY extensions/user-borders.ts /opt/pi-agent/extensions/user-borders.ts
+
+# system-prompt addendum: appended to pi's system prompt
+COPY APPEND_SYSTEM.md /opt/pi-agent/APPEND_SYSTEM.md
 
 # entrypoint: auto-login to opencode from env + preselect default model
 COPY pi-entrypoint.sh /usr/local/bin/pi-entrypoint.sh
