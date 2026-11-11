@@ -31,6 +31,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { fileHash } from "./hashline.ts";
+import { resolveEditSpans } from "./fuzzy-edit.ts";
 
 // --- snapshot store ---------------------------------------------------------
 
@@ -42,7 +43,89 @@ interface Snapshot {
 	hash: string; // short content fingerprint of the file as last seen
 	tag?: string; // 4-hex display tag (the [path#TAG] from read output); prefix of `hash`
 	text?: string; // content as last seen (omitted when too large)
+	seen?: SeenInfo; // which lines the model has actually seen in read output
 }
+
+// --- seen-lines tracking ----------------------------------------------------
+// omp-style TTSR enforcement (crates/pi-edit store.rs): alongside the whole-
+// file hash, track WHICH line numbers the model saw in read output. Edits
+// touching never-read lines are blocked — the model is guessing at content.
+
+interface SeenInfo {
+	lines: Set<number>; // 1-based line numbers seen in read output
+	all: boolean; // true when a read displayed the whole file (or the model wrote it)
+}
+
+/** Parse seen line numbers from read tool output ("N:content" lines + footer). */
+export const parseSeenLines = (content: ReadonlyArray<{ type: string; text?: string }> | undefined): SeenInfo | null => {
+	const text = (content ?? [])
+		.filter((c) => c.type === "text")
+		.map((c) => c.text ?? "")
+		.join("\n");
+	if (!text) return null;
+	const lines = new Set<number>();
+	for (const m of text.matchAll(/^(\d+):/gm)) lines.add(Number(m[1]));
+	if (lines.size === 0) return null;
+	// No truncation footer => everything was displayed => all seen. With the
+	// footer, a read that ran through EOF ("-12 of 340") also covers all.
+	let all = !text.includes("[Showing lines");
+	const footer = text.match(/\[Showing lines \d+-\d+ of (\d+)/);
+	if (footer) {
+		const total = Number(footer[1]);
+		let maxSeen = 0;
+		for (const l of lines) maxSeen = Math.max(maxSeen, l);
+		if (maxSeen >= total) all = true;
+	}
+	return { lines, all };
+};
+
+/** Merge two seen-infos; either side "all" wins. */
+const mergeSeen = (a: SeenInfo | undefined | null, b: SeenInfo): SeenInfo =>
+	a?.all ? a : { lines: new Set([...(a?.lines ?? []), ...b.lines]), all: b.all };
+
+/** Carry seen-lines across a successful edit: drop replaced lines, shift the
+ *  tail by the line-count delta, mark the authored replacement as seen.
+ *  Null seen (file never read) stays untracked. */
+const carrySeen = (
+	seen: SeenInfo | undefined,
+	spans: Array<{ startLine: number; endLine: number; newLineCount: number }>,
+): SeenInfo | null => {
+	if (!seen) return null;
+	if (seen.all) return seen;
+	const lines = new Set(seen.lines);
+	let shift = 0;
+	for (const span of [...spans].sort((a, b) => a.startLine - b.startLine)) {
+		const start = span.startLine + shift; // 0-based inclusive
+		const end = span.endLine + shift; // 0-based exclusive
+		const delta = span.newLineCount - (end - start);
+		for (let l = start + 1; l <= end; l++) lines.delete(l);
+		const adjusted = new Set<number>();
+		for (const l of lines) adjusted.add(l > end ? l + delta : l);
+		for (let l = start + 1; l <= start + span.newLineCount; l++) adjusted.add(l);
+		lines.clear();
+		for (const l of adjusted) lines.add(l);
+		shift += delta;
+	}
+	return { lines, all: false };
+};
+
+/** Compact "1-50, 200-250" summary of a seen set (capped). */
+const summarizeSeen = (lines: Set<number>): string => {
+	const sorted = [...lines].sort((a, b) => a - b);
+	const ranges: string[] = [];
+	for (let i = 0; i < sorted.length; ) {
+		let j = i;
+		while (j + 1 < sorted.length && sorted[j + 1] === sorted[j] + 1) j++;
+		ranges.push(sorted[i] === sorted[j] ? `${sorted[i]}` : `${sorted[i]}-${sorted[j]}`);
+		i = j + 1;
+	}
+	const shown = ranges.slice(0, 6).join(", ");
+	return ranges.length > 6 ? `${shown}, … (+${ranges.length - 6} more ranges)` : shown || "nothing";
+};
+
+// Spans resolved at tool_call time (pre-edit coordinates), consumed at
+// tool_result time to carry the seen-set across the edit.
+const pendingSpans = new Map<string, Array<{ startLine: number; endLine: number; newLineCount: number }>>();
 
 const snapshots = new Map<string, Snapshot>(); // key: canonical path
 
@@ -80,9 +163,13 @@ const currentSnapshot = (p: string): Snapshot | null => {
 	}
 };
 
-const remember = (p: string) => {
+const remember = (p: string, seen?: SeenInfo | null) => {
+	const key = canonical(p);
 	const snap = currentSnapshot(p);
-	if (snap) snapshots.set(canonical(p), snap);
+	if (!snap) return;
+	const prev = snapshots.get(key);
+	snap.seen = seen ? mergeSeen(prev?.seen, seen) : (prev?.seen ?? undefined);
+	snapshots.set(key, snap);
 };
 
 // --- line diff (LCS) ---------------------------------------------------------
@@ -274,6 +361,7 @@ export default function (pi: ExtensionAPI) {
 
 	// Layer 1: snapshot on every successful read; refresh after edit/write
 	pi.on("tool_result", async (event) => {
+		if (event.toolName === "edit") pendingSpans.delete(event.toolCallId); // no leak on failed edits
 		if (event.isError) return;
 		const input = (event.input ?? {}) as { path?: string; file_path?: string };
 		const p = input.path ?? input.file_path;
@@ -322,7 +410,7 @@ export default function (pi: ExtensionAPI) {
 						? renderReveal(diffHunks(seen.text, now.text) ?? [])
 						: null;
 				if (reveal) {
-					snapshots.set(key, now); // revealed state is now the model's baseline
+					snapshots.set(key, { ...now, seen: seen.seen }); // revealed state is now the model's baseline
 					return {
 						block: true,
 						reason:
@@ -342,6 +430,44 @@ export default function (pi: ExtensionAPI) {
 						"Something (bash, eval, another process) modified it out-of-band, and the change is too large to summarize. " +
 						"Re-read the file and re-apply your change against the current content.",
 				};
+			}
+
+			// Layer 2b: seen-lines enforcement (TTSR, ported from omp). The model
+			// may only edit lines it has actually seen in read output — editing
+			// never-read lines is guessing at content. Per edit block; spans are
+			// located in the snapshot text (exact, then whitespace-insensitive
+			// via fuzzy-edit's resolveEditSpans). Skipped when the file was
+			// never read (nothing to enforce) or fully seen.
+			const seenInfo = seen.seen;
+			const edits = (input.edits ?? []) as Array<{ oldText: string; newText: string }>;
+			if (seenInfo && !seenInfo.all && seen.text !== undefined && edits.length > 0) {
+				const spans = resolveEditSpans(seen.text, edits);
+				if (spans) {
+					const unseen = spans.find((s) => {
+						for (let l = s.startLine + 1; l <= s.endLine; l++) if (seenInfo.lines.has(l)) return false;
+						return true;
+					});
+					if (unseen) {
+						const from = unseen.startLine + 1;
+						const to = unseen.endLine;
+						return {
+							block: true,
+							reason:
+								`edit-guard: edits[${unseen.editIndex}] targets lines ${from}–${to} of ${p}, ` +
+								`which you have never read in this session (read so far: ${summarizeSeen(seenInfo.lines)}). ` +
+								`Editing text you have not seen is a guess. ` +
+								`Read that region (read offset=${from} limit=${to - from + 1}), then re-apply your edit.`,
+						};
+					}
+					pendingSpans.set(
+						event.toolCallId,
+						spans.map((s) => ({
+							startLine: s.startLine,
+							endLine: s.endLine,
+							newLineCount: edits[s.editIndex].newText.split("\n").length,
+						})),
+					);
+				}
 			}
 
 			// successful write replaces the whole file without a prior read:

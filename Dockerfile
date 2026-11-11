@@ -80,6 +80,11 @@ COPY extensions/edit-guard.ts /opt/pi-agent/extensions/edit-guard.ts
 COPY extensions/hashline.ts /opt/pi-agent/extensions/hashline.ts
 COPY extensions/hashline-read.ts /opt/pi-agent/extensions/hashline-read.ts
 
+# fuzzy-edit extension: whitespace-insensitive fallback for `edit` (tab vs
+# space mismatches) with re-indentation and whitespace-specific errors
+# (edit-guard.ts imports its resolveEditSpans, so both must be installed)
+COPY extensions/fuzzy-edit.ts /opt/pi-agent/extensions/fuzzy-edit.ts
+
 # subagents extension: task delegation to isolated `pi` subprocesses
 # (single/parallel/chain modes, agents defined as markdown frontmatter);
 # its agent defs and prompt templates go into the agent dir too
