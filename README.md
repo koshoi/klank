@@ -76,7 +76,7 @@ The container entrypoint:
   - `GET /health` — liveness probe
   - `GET /status` — agent state: busy/idle, model, session, context usage
   - `GET /messages` — recent transcript messages, indexed newest-first
-    (`?from=0` offset, `?limit=1`, `?role=user,assistant,toolResult`,
+    (`?from=0` offset, `?limit=1`, `?role=user,assistant,tool`,
     `?text=1` flattens content blocks to plain text; `text=0` returns raw
     blocks under a `content` key instead)
   - `POST /message` — body is injected as a user message (queued as a

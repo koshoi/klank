@@ -46,6 +46,15 @@ export default function (pi: ExtensionAPI) {
 	const inFlight = new Set<string>(); // spool message ids awaiting agent settle
 	const waiters: Array<() => void> = []; // POST /message?wait=1 responders
 
+	// invoke an optional method via its object so `this` stays bound:
+	// SessionManager methods read `this` (e.g. buildContextEntries() ->
+	// this.getEntries()); an unbound call throws
+	// "Cannot read properties of undefined (reading 'getEntries')"
+	const call = (obj: unknown, fnName: string, ...args: unknown[]) => {
+		const fn = (obj as Record<string, unknown> | undefined)?.[fnName];
+		return typeof fn === "function" ? (fn as (...a: unknown[]) => unknown).apply(obj, args) : null;
+	};
+
 	const receipt = (id: string, kind: string, note = "") => {
 		try {
 			fs.writeFileSync(path.join(INBOX, `${id}.${kind}`), note);
@@ -172,22 +181,20 @@ export default function (pi: ExtensionAPI) {
 			model = { id: m.id ?? null, provider: m.provider ?? null, name: m.name ?? null };
 		}
 		// event contexts do not always carry the optional action helpers;
-		// only call them when present
-		const call = (fn: unknown, ...args: unknown[]) =>
-			typeof fn === "function" ? (fn as (...a: unknown[]) => unknown)(...args) : null;
+		// only call them when present (see `call` above)
 		const sm = ctx?.sessionManager as unknown as Record<string, unknown> | undefined;
 		return {
 			pid: process.pid,
 			uptimeSec: Math.round((Date.now() - startedAt) / 1000),
 			busy,
-			idle: call(ctx?.isIdle) ?? !busy,
-			pending: call(ctx?.hasPendingMessages),
+			idle: call(ctx, "isIdle") ?? !busy,
+			pending: call(ctx, "hasPendingMessages"),
 			model,
 			thinkingLevel: ctx?.thinkingLevel ?? null,
 			cwd: ctx?.cwd ?? null,
-			sessionFile: call(sm?.getSessionFile),
-			sessionName: call(sm?.getSessionName),
-			contextUsage: call(ctx?.getContextUsage),
+			sessionFile: call(sm, "getSessionFile"),
+			sessionName: call(sm, "getSessionName"),
+			contextUsage: call(ctx, "getContextUsage"),
 		};
 	};
 
@@ -202,7 +209,7 @@ export default function (pi: ExtensionAPI) {
 			{ method: "GET", path: "/", description: "this discovery document" },
 			{ method: "GET", path: "/health", description: `liveness probe -> ${JSON.stringify({ ok: true })}` },
 			{ method: "GET", path: "/status", description: "agent state: busy/idle, model, session, context usage" },
-			{ method: "GET", path: "/messages", description: "recent transcript messages, newest-first (?from=0 offset, ?limit=1, ?role=user,assistant,toolResult, ?text=1 flattens content to text)" },
+			{ method: "GET", path: "/messages", description: "recent transcript messages, newest-first (?from=0 offset, ?limit=1, ?role=user,assistant,tool, ?text=1 flattens content to text; tool messages include the originating toolCall)" },
 			{ method: "POST", path: "/message", description: "inject a user message (body = text; ?wait=1 long-polls until the agent settles)" },
 		],
 	});
@@ -219,7 +226,10 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	const LIMIT_MAX = 500;
-	const MESSAGE_ROLES = new Set(["user", "assistant", "toolResult"]);
+	// wire format uses "tool" for tool-result messages (pi's internal role is
+	// "toolResult"); both the filter and the emitted role use the wire name
+	const MESSAGE_ROLES = new Set(["user", "assistant", "tool"]);
+	const wireRole = (role: string): string => (role === "toolResult" ? "tool" : role);
 
 	// flattenText joins text blocks of a message content (string or block array)
 	const flattenText = (content: unknown): string => {
@@ -240,18 +250,25 @@ export default function (pi: ExtensionAPI) {
 		model?: string;
 		stopReason?: string;
 		toolName?: string;
+		toolCallId?: string;
 		isError?: boolean;
 	};
 
-	// shapeMessage projects a session entry into the wire format for /messages
-	const shapeMessage = (entry: AnyEntry, raw: boolean): Record<string, unknown> => {
+	// shapeMessage projects a session entry into the wire format for /messages;
+	// toolCallsById maps toolCall id -> the assistant's toolCall block, so tool
+	// messages can carry the call they answer
+	const shapeMessage = (
+		entry: AnyEntry,
+		raw: boolean,
+		toolCallsById: Map<string, { id: string | null; name: string | null; arguments: unknown }>,
+	): Record<string, unknown> => {
 		const msg = entry.message ?? {};
 		const role = msg.role ?? "";
 		const out: Record<string, unknown> = {
 			id: entry.id ?? null,
 			parentId: entry.parentId ?? null,
 			timestamp: entry.timestamp ?? null,
-			role,
+			role: wireRole(role),
 		};
 		if (raw) {
 			out.content = msg.content ?? [];
@@ -268,6 +285,8 @@ export default function (pi: ExtensionAPI) {
 		} else if (role === "toolResult") {
 			out.toolName = msg.toolName ?? null;
 			out.isError = Boolean(msg.isError);
+			const call = msg.toolCallId ? toolCallsById.get(msg.toolCallId) : undefined;
+			out.toolCall = call ?? { id: msg.toolCallId ?? null, name: msg.toolName ?? null, arguments: null };
 		}
 		return out;
 	};
@@ -288,8 +307,8 @@ export default function (pi: ExtensionAPI) {
 			for (const r of roleParam.split(",")) {
 				const role = r.trim();
 				if (!role) continue; // tolerate empty items ("user,", " user")
-				if (!MESSAGE_ROLES.has(role)) return { error: `invalid role: ${role} (allowed: user, assistant, toolResult)` };
-				roles.add(role);
+				if (!MESSAGE_ROLES.has(wireRole(role))) return { error: `invalid role: ${role} (allowed: user, assistant, tool)` };
+				roles.add(wireRole(role));
 			}
 			if (roles.size === 0) roles = null; // "," or whitespace-only = no filter
 		}
@@ -303,14 +322,28 @@ export default function (pi: ExtensionAPI) {
 		const sm = lastCtx?.sessionManager as unknown as
 			| { buildContextEntries?: () => AnyEntry[]; getBranch?: () => AnyEntry[] }
 			| undefined;
-		const call = (fn: unknown): AnyEntry[] => (typeof fn === "function" ? (fn as () => AnyEntry[])() : []);
-		const entries = call(sm?.buildContextEntries) || call(sm?.getBranch);
+		// invoke via the object so `this` stays bound: buildContextEntries()
+		// reads this.getEntries(), and an unbound call throws
+		// "Cannot read properties of undefined (reading 'getEntries')"
+		const entries = (call(sm, "buildContextEntries") || call(sm, "getBranch")) as AnyEntry[];
+
+		// index assistant tool calls by id so tool results can carry their call
+		const toolCallsById = new Map<string, { id: string | null; name: string | null; arguments: unknown }>();
+		for (const e of entries) {
+			if (!e || e.type !== "message" || e.message?.role !== "assistant") continue;
+			const blocks = Array.isArray(e.message.content) ? (e.message.content as AnyBlock[]) : [];
+			for (const b of blocks) {
+				if (b?.type === "toolCall" && typeof b.id === "string") {
+					toolCallsById.set(b.id, { id: b.id, name: b.name ?? null, arguments: b.arguments ?? {} });
+				}
+			}
+		}
 
 		const filtered = entries.filter((e) => {
 			if (!e || e.type !== "message") return false;
 			const role = e.message?.role;
 			if (!role || role === "system" || role === "custom") return false;
-			return !roles || roles.has(role);
+			return !roles || roles.has(wireRole(role));
 		});
 
 		// total reflects the role filter (if any), not the whole transcript,
@@ -322,7 +355,7 @@ export default function (pi: ExtensionAPI) {
 		return {
 			total: filtered.length,
 			count: slice.length,
-			messages: slice.map((e) => shapeMessage(e, raw)),
+			messages: slice.map((e) => shapeMessage(e, raw, toolCallsById)),
 		};
 	};
 
