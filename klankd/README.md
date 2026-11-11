@@ -66,6 +66,20 @@ the caddy binary, `-db` database path, `--once` (sync once, no caddy).
 Defaults: poll 2s, `~/.klank/Caddyfile`, domain from
 `$KLANK_PROXY_DOMAIN` or `klank.localhost`.
 
+### Running under sudo
+
+If the daemon must run as root (e.g. because caddy needs to bind port
+80), pass `-u <user>` so everything else still behaves like a user
+run:
+
+    sudo ./klankd -u $USER
+
+`-u` accepts a username, a numeric uid, or `uid:gid` / `user:group`.
+It makes the daemon resolve `~/.klank` under that user's home, chown
+the Caddyfile and dashboard files to that user (never root), and point
+the supervised caddy's `HOME`/`USER` there. Caddy itself keeps the
+daemon's privileges so it can still bind port 80.
+
 `*.klank.localhost` (including `klank.localhost` itself) resolves to
 127.0.0.1 out of the box on systemd-resolved and modern browsers. For
 a custom suffix, set `KLANK_PROXY_DOMAIN` in the environment and add a

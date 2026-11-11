@@ -12,6 +12,7 @@
 //
 // Build:  CGO_ENABLED=0 go build -o klankd .
 // Run:    ./klankd            (as the klank user; see -h)
+//         sudo ./klankd -u $USER   (root for port 80, user for everything else)
 package main
 
 import (
@@ -26,6 +27,7 @@ import (
 	"os/signal"
 	"os/user"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -60,7 +62,25 @@ func main() {
 	caddyBin := flag.String("caddy", "caddy", "path to the caddy binary to supervise")
 	dbPath := flag.String("db", "", "klank database path (default ~/.klank/klank.db)")
 	once := flag.Bool("once", false, "sync once and exit (no polling, no caddy)")
+	runAs := flag.String("u", "", "act on behalf of this user (name, uid, or uid:gid): ~/.klank resolves to their home and generated files are chowned to them; for sudo runs, e.g. sudo klankd -u $USER")
 	flag.Parse()
+
+	// -u: act on behalf of another user. Intended for `sudo klankd -u
+	// $USER`, where root is needed to bind port 80 but everything else
+	// (paths, file ownership, the caddy child) must look like a normal
+	// user run so klank and caddy never touch root-owned files.
+	// Defaults -1/-1: with no -u, files are never chowned at all.
+	var runAsUser *user.User
+	var runAsUID, runAsGID = -1, -1
+	if *runAs != "" {
+		u, err := lookupUserSpec(*runAs)
+		if err != nil {
+			log.Fatalf("-u %q: %v", *runAs, err)
+		}
+		uid, _ := strconv.Atoi(u.Uid)
+		gid, _ := strconv.Atoi(u.Gid)
+		runAsUser, runAsUID, runAsGID = u, uid, gid
+	}
 
 	if *domain == "" {
 		*domain = os.Getenv("KLANK_PROXY_DOMAIN")
@@ -72,6 +92,9 @@ func main() {
 		log.Fatalf("interval must be at least 250ms")
 	}
 	home := homeDir()
+	if runAsUser != nil {
+		home = runAsUser.HomeDir
+	}
 	if *file == "" {
 		*file = filepath.Join(home, ".klank", "Caddyfile")
 	}
@@ -81,13 +104,6 @@ func main() {
 	if _, err := os.Stat(*dbPath); err != nil {
 		log.Fatalf("klank database not readable: %v (run as the klank user, or pass -db)", err)
 	}
-
-	// Caddy is a hard dependency — it is the thing that serves the
-	// routes and the dashboard. Fail fast (systemd retries with backoff).
-	if _, err := exec.LookPath(*caddyBin); err != nil {
-		log.Fatalf("caddy binary %q not found: %v (install caddy, or pass -caddy with the full path)", *caddyBin, err)
-	}
-
 	// Open read-only: this daemon must never write to klank's database.
 	// WAL journal mode lets our reads proceed while klank writes.
 	dsn := "file:" + *dbPath + "?mode=ro&_pragma=busy_timeout(5000)"
@@ -112,8 +128,15 @@ func main() {
 			log.Printf("create %s: %v", dir, err)
 			return false
 		}
+		// -u: the directory must belong to the target user or klank
+		// (running as that user) cannot write next to these files later
+		if runAsUser != nil {
+			if err := os.Chown(dir, runAsUID, runAsGID); err != nil {
+				log.Printf("chown %s: %v", dir, err)
+			}
+		}
 
-		changed, err := writeIfChanged(*file, renderCaddyfile(routes, *domain, dir))
+		changed, err := writeIfChanged(*file, renderCaddyfile(routes, *domain, dir), runAsUID, runAsGID)
 		if err != nil {
 			log.Printf("write %s: %v", *file, err)
 			return false
@@ -128,7 +151,7 @@ func main() {
 			{filepath.Join(dir, "index.html"), renderDashboard(routes, *domain)}, // named index.html so caddy's file_server serves it at /
 			{filepath.Join(dir, "klank-agents.json"), agentsJSON(routes)},
 		} {
-			if c, err := writeIfChanged(f.path, f.content); err != nil {
+			if c, err := writeIfChanged(f.path, f.content, runAsUID, runAsGID); err != nil {
 				log.Printf("write %s: %v", f.path, err)
 			} else if c {
 				log.Printf("updated %s", f.path)
@@ -146,6 +169,13 @@ func main() {
 		return
 	}
 
+	// Caddy is a hard dependency — it is the thing that serves the
+	// routes and the dashboard. Fail fast (systemd retries with backoff).
+	// (--once skips this: it neither starts nor reloads caddy.)
+	if _, err := exec.LookPath(*caddyBin); err != nil {
+		log.Fatalf("caddy binary %q not found: %v (install caddy, or pass -caddy with the full path)", *caddyBin, err)
+	}
+
 	log.Printf("polling %s every %s; writing %s; domain .%s; dashboard at %s", *dbPath, *interval, *file, *domain, *domain)
 
 	// First sync before starting caddy so it boots with current config.
@@ -160,6 +190,13 @@ func main() {
 	startCaddyAndWait := func() {
 		cmd := exec.Command(*caddyBin, "run", "--config", *file, "--adapter", "caddyfile")
 		cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
+		// -u: caddy deliberately keeps the daemon's (root) privileges —
+		// binding port 80 is usually why the daemon runs under sudo at
+		// all. Only its HOME/USER are pointed at the -u user so caddy
+		// resolves its data/config dirs there, not in /root.
+		if runAsUser != nil {
+			cmd.Env = append(os.Environ(), "HOME="+runAsUser.HomeDir, "USER="+runAsUser.Username)
+		}
 		if err := cmd.Start(); err != nil {
 			log.Printf("cannot start caddy: %v", err)
 			caddyProc = nil
@@ -412,11 +449,14 @@ func openAttr(i int) string {
 }
 
 // writeIfChanged compares before writing so unchanged polls are a no-op.
-func writeIfChanged(path, content string) (bool, error) {
+// uid/gid (from -u) are applied to the file whenever it is written or
+// found owned by someone else (e.g. created by an earlier root run).
+func writeIfChanged(path, content string, uid, gid int) (bool, error) {
 	if cur, err := os.ReadFile(path); err == nil && string(cur) == content {
+		fixOwner(path, uid, gid)
 		return false, nil
 	}
-	if err := writeFileAtomic(path, content); err != nil {
+	if err := writeFileAtomic(path, content, uid, gid); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -424,7 +464,9 @@ func writeIfChanged(path, content string) (bool, error) {
 
 // writeFileAtomic writes via a temp file in the same directory and
 // renames, so a concurrent caddy reload never sees a half-written file.
-func writeFileAtomic(path, content string) error {
+// The temp file is chowned before rename: rename keeps ownership, so
+// the installed file ends up owned by the -u user, not root.
+func writeFileAtomic(path, content string, uid, gid int) error {
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".tmp")
 	if err != nil {
@@ -439,10 +481,57 @@ func writeFileAtomic(path, content string) error {
 		tmp.Close()
 		return err
 	}
+	if uid != -1 {
+		if err := tmp.Chown(uid, gid); err != nil {
+			tmp.Close()
+			return err
+		}
+	}
 	if err := tmp.Close(); err != nil {
 		return err
 	}
 	return os.Rename(tmp.Name(), path)
+}
+
+// fixOwner chowns path if it is currently owned by someone else
+// (non-root callers pass -1 and skip the syscall entirely).
+func fixOwner(path string, uid, gid int) {
+	if uid == -1 {
+		return
+	}
+	if st, err := os.Stat(path); err == nil {
+		if st.Sys().(*syscall.Stat_t).Uid != uint32(uid) {
+			if err := os.Chown(path, uid, gid); err != nil {
+				log.Printf("chown %s: %v", path, err)
+			}
+		}
+	}
+}
+
+// lookupUserSpec resolves a -u value: a username, a numeric uid, or
+// "uid:gid" / "user:group" to override the primary group.
+func lookupUserSpec(spec string) (*user.User, error) {
+	name, group := spec, ""
+	if i := strings.Index(spec, ":"); i >= 0 {
+		name, group = spec[:i], spec[i+1:]
+	}
+	u, err := user.LookupId(name)
+	if err != nil {
+		u, err = user.Lookup(name)
+		if err != nil {
+			return nil, fmt.Errorf("unknown user %q", name)
+		}
+	}
+	if group != "" {
+		if g, err := user.LookupGroup(group); err == nil {
+			u.Gid = g.Gid
+		} else if _, numErr := strconv.Atoi(group); numErr != nil {
+			return nil, fmt.Errorf("unknown group %q", group)
+		} else {
+			u.Gid = group // numeric gid, no /etc/group entry needed
+		}
+	}
+	return u, nil
 }
 
 func homeDir() string {
