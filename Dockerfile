@@ -4,6 +4,21 @@ RUN apt-get update \
   && apt-get install -y --no-install-recommends bash ca-certificates git ripgrep curl jq fzf \
   && rm -rf /var/lib/apt/lists/*
 
+# fd: bake in the same static musl binary pi's tools-manager would download
+# (sharkdp/fd GitHub release). Resolve the latest version the same way pi does
+# — via the /releases/latest redirect, avoiding the rate-limited api.github.com.
+# Placed in pi's own tools dir ($PI_CODING_AGENT_DIR/bin/fd), which pi checks
+# before PATH, so it never re-downloads at session start.
+RUN set -eux; \
+  mkdir -p /opt/pi-agent/bin; \
+  ver="$(curl -fsSL -o /dev/null -w '%{redirect_url}' https://github.com/sharkdp/fd/releases/latest \
+        | sed 's|.*/tag/v||')"; \
+  echo "fd version: ${ver}"; \
+  curl -fsSL "https://github.com/sharkdp/fd/releases/download/v${ver}/fd-v${ver}-x86_64-unknown-linux-musl.tar.gz" \
+    | tar -xz -C /opt/pi-agent/bin --strip-components=1 "fd-v${ver}-x86_64-unknown-linux-musl/fd"; \
+  chmod 0755 /opt/pi-agent/bin/fd; \
+  /opt/pi-agent/bin/fd --version
+
 # golang (hardcoded current latest: go1.27.3)
 RUN set -eux; \
   curl -fsSLO "https://go.dev/dl/go1.27.3.linux-amd64.tar.gz"; \
