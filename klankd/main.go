@@ -298,13 +298,20 @@ func loadRoutes(db *sql.DB, domain string) ([]route, error) {
 // block per route plus the dashboard site (file_server on the domain
 // root). The header is static so unchanged mappings produce
 // byte-identical files (content comparison decides when to reload).
+//
+// Cache-Control no-cache on the dashboard site: without it, browsers
+// heuristically cache file_server responses (Last-Modified only, no
+// Cache-Control) for ~10% of the file's age, so the dashboard and
+// klank-agents.json go stale for minutes-to-hours and show removed
+// agents. no-cache keeps 304 revalidation (cheap) but forces a
+// revalidation on every request, which is what a live status page needs.
 func renderCaddyfile(routes []route, domain, dashboardRoot string) string {
 	var b strings.Builder
 	b.WriteString("# managed by klankd -- DO NOT EDIT\n")
 	// explicit http:// scheme: without it caddy treats every site as
 	// HTTPS (auto-redirect + local TLS certs), which breaks plain-http
 	// *.klank.localhost names that never leave the machine
-	b.WriteString(fmt.Sprintf("\nhttp://%s {\n\troot * %s\n\tfile_server\n}\n", domain, dashboardRoot))
+	b.WriteString(fmt.Sprintf("\nhttp://%s {\n\troot * %s\n\tfile_server\n\theader Cache-Control \"no-cache\"\n}\n", domain, dashboardRoot))
 	for _, r := range routes {
 		b.WriteString(fmt.Sprintf("\nhttp://%s {\n\treverse_proxy %s\n}\n", r.fqdn, r.upstream))
 	}
@@ -431,7 +438,7 @@ function render(agents) {
 	});
 }
 async function refresh() {
-	try { const r = await fetch('klank-agents.json'); render(await r.json()); } catch (e) {}
+	try { const r = await fetch('klank-agents.json', {cache: 'no-store'}); render(await r.json()); } catch (e) {}
 }
 refresh(); setInterval(refresh, 5000);
 </script>`)
