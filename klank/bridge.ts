@@ -100,12 +100,12 @@ export default function (pi: ExtensionAPI) {
 		lastCtx = ctx;
 	};
 
-	pi.on("agent_start", (ctx: ExtensionContext) => {
+	pi.on("agent_start", (_event, ctx: ExtensionContext) => {
 		remember(ctx);
 		busy = true;
 	});
 
-	pi.on("agent_settled", (ctx: ExtensionContext) => {
+	pi.on("agent_settled", (_event, ctx: ExtensionContext) => {
 		remember(ctx);
 		busy = false;
 		if (inFlight.size === 0 && waiters.length === 0) return;
@@ -115,7 +115,7 @@ export default function (pi: ExtensionAPI) {
 		for (const w of pending) w();
 	});
 
-	pi.on("session_start", (ctx: ExtensionContext) => {
+	pi.on("session_start", (_event, ctx: ExtensionContext) => {
 		remember(ctx);
 		try {
 			fs.mkdirSync(INBOX, { recursive: true, mode: 0o777 });
