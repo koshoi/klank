@@ -10,7 +10,8 @@
  *   undo      u / ctrl+r (redo; cooperates with the editor's ctrl+- undo)
  *   insert    i a I A (and everything above that ends in insert mode)
  *
- * Mode indicator: top border label (NORMAL / INSERT / pending operator)
+ * Mode indicator: label at the start of the prompt line
+ * (NORMAL / INSERT / pending operator, bold black on colored bg)
  * plus a cursor shape change (block = normal, beam = insert).
  *
  * Everything not handled here (Enter, ctrl+c, tab/autocomplete, paste,
@@ -380,12 +381,6 @@ export class VimEditor extends CustomEditor {
 		}
 	}
 
-	private ggTarget(count: number, hasCount: boolean): MotionResult {
-		const p = this.cur();
-		const line = hasCount ? Math.max(0, count - 1) : 0;
-		return { pos: this.normalClamp({ line, col: p.col }), linewise: line !== p.line };
-	}
-
 	// ------------------------------------------------------------------
 	// Operators
 	// ------------------------------------------------------------------
@@ -586,9 +581,9 @@ export class VimEditor extends CustomEditor {
 		if (this.pendingG) {
 			this.pendingG = false;
 			if (data === "g") {
-				this.finishMotion(this.ggTarget(this.effCount(), this.count1 !== null || this.count2 !== null));
-				this.count1 = null;
-				this.count2 = null;
+				// gg: jump to the top of the transcript, like vim's gg on a viewport
+				const tui = this.int.tui;
+				if (typeof tui?.scrollToTop === "function") tui.scrollToTop();
 				return;
 			}
 			this.count1 = null;
@@ -596,16 +591,17 @@ export class VimEditor extends CustomEditor {
 			// fall through: treat as unknown key
 		}
 
-		// counts (0 is a motion when no count is active)
+		// counts (0 is a motion when no count is active) — single digits only, so
+		// the mode label's reserved width (" 9d9·PENDING ") always fits
 		if (data >= "1" && data <= "9") {
 			const n = Number(data);
-			if (this.op) this.count2 = (this.count2 ?? 0) * 10 + n;
-			else this.count1 = (this.count1 ?? 0) * 10 + n;
+			if (this.op) this.count2 = Math.min(9, (this.count2 ?? 0) * 10 + n);
+			else this.count1 = Math.min(9, (this.count1 ?? 0) * 10 + n);
 			return;
 		}
 		if (data === "0" && (this.count1 !== null || this.count2 !== null)) {
-			if (this.op) this.count2 = (this.count2 ?? 0) * 10;
-			else this.count1 = (this.count1 ?? 0) * 10;
+			if (this.op) this.count2 = Math.min(9, (this.count2 ?? 0) * 10);
+			else this.count1 = Math.min(9, (this.count1 ?? 0) * 10);
 			return;
 		}
 
@@ -662,6 +658,13 @@ export class VimEditor extends CustomEditor {
 				this.pendingG = true;
 				return;
 
+			// G: jump to the end of the transcript (scroll viewport to bottom)
+			case "G": {
+				const tui = this.int.tui;
+				if (typeof tui?.scrollToBottom === "function") tui.scrollToBottom();
+				return;
+			}
+
 			case "r":
 				this.pendingReplace = true;
 				return;
@@ -670,6 +673,13 @@ export class VimEditor extends CustomEditor {
 			case "i":
 				this.enterInsert();
 				return;
+			case "/": {
+				// normal mode has no use for "/": enter insert mode and type it,
+				// so pi slash commands like /reload can be typed immediately
+				this.enterInsert();
+				super.handleInput("/");
+				return;
+			}
 			case "I": {
 				this.int.setCursorCol(this.firstNonBlank(this.cur().line));
 				this.enterInsert();
@@ -817,7 +827,11 @@ export class VimEditor extends CustomEditor {
 			const startLine = this.cur().line;
 			this.finishMotion(res);
 			if ((data === "j" || data === "k") && res.pos.line === startLine) {
-				super.handleInput(orig);
+				// Cannot move further within the input: scroll the transcript one
+				// line (per count), exactly like the arrow keys do via their
+				// tui.altScreen.lineUp/lineDown bindings.
+				const tui = this.int.tui;
+				if (typeof tui?.scrollBy === "function") tui.scrollBy(data === "j" ? total : -total);
 			}
 			return;
 		}
@@ -884,35 +898,56 @@ export class VimEditor extends CustomEditor {
 	}
 
 	// ------------------------------------------------------------------
-	// Mode indicator (top border)
+	// Mode indicator (start of the prompt line)
 	// ------------------------------------------------------------------
 
-	protected override renderTopBorder(width: number, hiddenLineCount: number): string {
-		const base = super.renderTopBorder(width, hiddenLineCount);
-		// pi passes the editor factory a reduced theme ({ borderColor, selectList })
-		// with no .fg(); the full theme is ctx.ui.theme (live getter, always current).
+	/** Mode label: NORMAL / INSERT / pending operator ("2d3").
+	 * All states are padded to a constant width (NORMAL/INSERT are the widest
+	 * at 8 cols, " 9d9 " fits inside), so the prompt text never shifts.
+	 * Style: bold black text on a colored background (theme accent colors). */
+	private modeLabel(): string {
+		const LABEL_WIDTH = " NORMAL ".length;
+		const padTo = (s: string): string => s + " ".repeat(Math.max(0, LABEL_WIDTH - visibleWidth(s)));
 		const theme = fullThemeRef?.ui?.theme as
-			| { fg?: (name: string, text: string) => string }
+			| {
+					style?: (text: string, options: Record<string, unknown>) => string;
+					colors?: Record<string, unknown>;
+				}
 			| undefined;
-		const fg = (name: string, text: string): string =>
-			typeof theme?.fg === "function" ? theme.fg(name, text) : text;
-		let label: string;
+		const styled = (text: string, token: string): string => {
+			const bgColor = theme?.colors?.[token];
+			if (typeof theme?.style === "function" && bgColor) {
+				// Black as a concrete rgb Color (strings would be theme token names);
+				// bg = a theme color token so the label actually has color.
+				return theme.style(text, { fg: { kind: "rgb", r: 0, g: 0, b: 0 }, bg: bgColor, bold: true });
+			}
+			return text;
+		};
 		if (this.mode === "insert") {
-			label = fg("success", " INSERT ");
-		} else if (this.op) {
+			return padTo(styled(" INSERT ", "success"));
+		}
+		if (this.op) {
 			// vim showcmd style: "2d3" (count typed before op, op, count after op)
 			const cnt =
 				(this.count1 === null ? "" : String(this.count1)) +
 				this.op +
 				(this.count2 === null ? "" : String(this.count2));
-			label = fg("warning", ` ${cnt}·PENDING `);
-		} else {
-			label = fg("accent", " NORMAL ");
+			return padTo(styled(` ${cnt} `, "warning"));
 		}
-		if (visibleWidth(base) >= visibleWidth(label)) {
-			return truncateToWidth(base, width - visibleWidth(label), "") + label;
+		return padTo(styled(" NORMAL ", "accent"));
+	}
+
+	/** Prepend the mode label + one plain space to the first prompt line, before the text/cursor. */
+	protected override render(width: number): string[] {
+		const lines = super.render(width);
+		const label = this.modeLabel();
+		// lines[0] is the top border; lines[1] is the first prompt/content line.
+		// Prepending is cursor-safe: the TUI locates the cursor by searching for
+		// CURSOR_MARKER inside the rendered line, so the label just shifts it.
+		if (lines.length > 2) {
+			lines[1] = truncateToWidth(label + " " + lines[1], width, "");
 		}
-		return base;
+		return lines;
 	}
 }
 
