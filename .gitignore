@@ -1,6 +1,9 @@
 # secrets: API keys, tokens
 .env
 
+# local klank config
+.klank.toml
+
 # built binary
 klank/klank
 
