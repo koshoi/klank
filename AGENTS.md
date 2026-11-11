@@ -38,6 +38,13 @@ Because of this:
 - When changing harness behavior, change it **here** (extensions /
   bridge / image), not by hand-patching the installed pi package at runtime.
   Runtime patches vanish when the container is rebuilt.
+- When **creating a new extension**, consider how it will interact with
+  **vim mode** — the user runs pi in vim mode (normal/insert/visual states)
+  all the time. Anything that touches keybindings, editor input, or the TUI
+  must play nicely with modal editing: don't swallow keys vim mode needs,
+  respect the current mode (e.g. don't hijack keys that differ per mode),
+  and test the extension with vim mode enabled rather than assuming default
+  (non-modal) input behavior.
 - The running pi session does **not** load extensions from this repo — they
   are baked into the image at **`/opt/pi-agent/extensions/`** (the agent dir
   is pinned via `PI_CODING_AGENT_DIR`). To make an extension change testable
