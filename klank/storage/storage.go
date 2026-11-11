@@ -114,9 +114,34 @@ func InsertAgent(db *sql.DB, cid, name, image, imageHash string, port int, tmuxS
 	return name, nil
 }
 
+// portsJSON normalizes the raw ports column (a JSON array of PortMapping
+// as stored by InsertAgent; '' or '-' when none were published) into a
+// cli.RawJSON so json output embeds it as an array instead of a string.
+func portsJSON(raw string) cli.RawJSON {
+	if raw == "" || raw == "-" {
+		return "[]"
+	}
+	return cli.RawJSON(raw)
+}
+
+// decodePortsColumn rewrites the "ports" column of a scanned result from
+// the raw stored string into a cli.RawJSON value.
+func decodePortsColumn(res *cli.QueryResult) {
+	for i, c := range res.Columns {
+		if c != "ports" {
+			continue
+		}
+		for _, row := range res.Rows {
+			if s, ok := row[i].(string); ok {
+				row[i] = portsJSON(s)
+			}
+		}
+	}
+}
+
 // ListAgents returns all known agents ordered by seq.
 func ListAgents(db *sql.DB) *cli.QueryResult {
-	rows, err := db.Query(`SELECT seq, id, coalesce(name,'-') as name, image, coalesce(image_hash,'-') as hash, coalesce(port,0) as port, coalesce(tmux_session,'-') as tmux_session, coalesce(tmux_pane,'-') as tmux_pane FROM agents ORDER BY seq`)
+	rows, err := db.Query(`SELECT seq, id, coalesce(name,'-') as name, image, coalesce(image_hash,'-') as hash, coalesce(port,0) as port, coalesce(tmux_session,'-') as tmux_session, coalesce(tmux_pane,'-') as tmux_pane, coalesce(ports,'-') as ports FROM agents ORDER BY seq`)
 	if err != nil {
 		cli.Fatal("query: %v", err)
 	}
@@ -125,6 +150,7 @@ func ListAgents(db *sql.DB) *cli.QueryResult {
 	if err != nil {
 		cli.Fatal("scan: %v", err)
 	}
+	decodePortsColumn(result)
 	return result
 }
 
@@ -139,6 +165,7 @@ func GetAgent(db *sql.DB, idOrName string) (*cli.QueryResult, bool) {
 	if err != nil {
 		cli.Fatal("scan: %v", err)
 	}
+	decodePortsColumn(result)
 	return result, len(result.Rows) > 0
 }
 

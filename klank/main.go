@@ -52,7 +52,7 @@ commands:
                    rename an agent (a recorded tmux session name
                    matching the old name is updated in the database;
                    the tmux session itself is left untouched)
-  port <id|name> [<name>]
+  port | ports <id|name> [<name>]
                    print the local address of a named container port
                    published with new -p: with a port name, only that
                    address (e.g. 127.0.0.1:81); without one, all of
@@ -127,6 +127,7 @@ func main() {
 		"d":  "debug",
 		"s":  "send",
 		"mv": "rename",
+		"ports": "port",
 	}
 	var args []string
 	argv := os.Args[1:]

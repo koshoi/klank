@@ -19,6 +19,20 @@ var OutputFormat = "text"
 // IsJSON reports whether the output format is json.
 func IsJSON() bool { return OutputFormat == "json" }
 
+// RawJSON is a string holding raw JSON (e.g. a stored column value) that
+// should be embedded verbatim into json output instead of being quoted as
+// a string. In text mode it prints like any other string. An empty value
+// encodes as null.
+type RawJSON string
+
+// MarshalJSON embeds the raw bytes verbatim (null when empty).
+func (r RawJSON) MarshalJSON() ([]byte, error) {
+	if r == "" {
+		return []byte("null"), nil
+	}
+	return []byte(r), nil
+}
+
 // Debug prints a [debug] line when DebugMode is enabled.
 func Debug(format string, a ...any) {
 	if DebugMode {
