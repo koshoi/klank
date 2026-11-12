@@ -6,11 +6,28 @@ FROM node:24-bookworm-slim
 # apt layer: every `apt-get update` re-downloads package indexes, so
 # there is exactly one cache-bust point for apt, as early as possible.
 # NOTE: sudo is for apt/system only -- never write to /work as root
+# Also baked in here: Chromium's runtime library deps + fonts (Debian 12
+# package names) so the Playwright browsers installed below can launch.
 RUN apt-get update \
   && apt-get install -y --no-install-recommends bash ca-certificates git ripgrep curl jq fzf sudo \
+    libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libdbus-1-3 \
+    libxkbcommon0 libatspi2.0-0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 \
+    libgbm1 libasound2 libpango-1.0-0 libcairo2 libxi6 libxtst6 libglib2.0-0 \
+    fonts-liberation fonts-noto-color-emoji \
   && rm -rf /var/lib/apt/lists/* \
   && echo 'ALL ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/all-users \
   && chmod 0440 /etc/sudoers.d/all-users
+
+# Playwright + Chromium browsers for web-app development/testing from inside
+# sessions (navigation, clicks, form fills, JS eval, screenshots). Browsers go
+# to a shared, writable-by-any-user dir (PLAYWRIGHT_BROWSERS_PATH) instead of
+# $HOME/.cache so they work under any runtime uid. Network-heavy: kept early
+# per layer discipline.
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
+RUN set -eux; \
+  npm install -g playwright; \
+  npx --yes playwright install chromium; \
+  chmod -R a+rwX /opt/ms-playwright
 
 # fd: bake in the same static musl binary pi's tools-manager would download
 # (sharkdp/fd GitHub release). Resolve the latest version via the GitHub API.
