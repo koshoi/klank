@@ -128,13 +128,13 @@ examples:
 func main() {
 	// command shorthands
 	aliases := map[string]string{
-		"n":  "new",
-		"a":  "attach",
-		"b":  "bash",
-		"ls": "list",
-		"d":  "debug",
-		"s":  "send",
-		"mv": "rename",
+		"n":     "new",
+		"a":     "attach",
+		"b":     "bash",
+		"ls":    "list",
+		"d":     "debug",
+		"s":     "send",
+		"mv":    "rename",
 		"ports": "port",
 	}
 	var args []string

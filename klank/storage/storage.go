@@ -13,29 +13,24 @@ import (
 	_ "modernc.org/sqlite"
 
 	"klank/cli"
+	"klank/klankdb"
 )
 
-// PortMapping describes one named container port published to the host's
-// loopback (see `klank new -p name=container-port`). Name is the handle
-// used by `klank port <agent> <name>`; Container is the port inside the
-// container, Host the port published on 127.0.0.1.
-type PortMapping struct {
-	Name      string `json:"name"`
-	Container int    `json:"container"`
-	Host      int    `json:"host"`
-}
+// PortMapping is the JSON schema of the agents.ports column, defined in
+// the cli-free klankdb package so klankd can share it without inheriting
+// this package's cli.Fatal error handling.
+type PortMapping = klankdb.PortMapping
 
 // Open opens (and creates, if needed) the agent database.
 func Open() *sql.DB {
-	home, err := os.UserHomeDir()
+	path, err := klankdb.DefaultPath("")
 	if err != nil {
-		cli.Fatal("cannot determine home dir: %v", err)
+		cli.Fatal("%v", err)
 	}
-	dir := filepath.Join(home, ".klank")
+	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		cli.Fatal("cannot create ~/.klank: %v", err)
+		cli.Fatal("cannot create %s: %v", dir, err)
 	}
-	path := filepath.Join(dir, "klank.db")
 	db, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)")
 	if err != nil {
 		cli.Fatal("open db: %v", err)
@@ -115,7 +110,8 @@ func InsertAgent(db *sql.DB, cid, name, image, imageHash string, port int, tmuxS
 }
 
 // portsJSON normalizes the raw ports column (a JSON array of PortMapping
-// as stored by InsertAgent; '' or '-' when none were published) into a
+// as stored by InsertAgent; the empty string or '-' when none were
+// published) into a
 // cli.RawJSON so json output embeds it as an array instead of a string.
 func portsJSON(raw string) cli.RawJSON {
 	if raw == "" || raw == "-" {

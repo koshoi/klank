@@ -42,9 +42,11 @@ SIGINT/SIGTERM (stopping caddy gracefully first) or a crash.
 
 ## Install & run
 
-Build and run the binary yourself:
+Build and run the binary yourself (from the repository root; klank and
+klankd live in one Go module under `klank/`):
 
-    CGO_ENABLED=0 go build -ldflags="-s -w" -o klankd .
+    cd klank
+    CGO_ENABLED=0 go build -ldflags="-s -w" -o klankd ./cmd/klankd
     ./klankd
 
 Requires `caddy` (hard dependency — the daemon exits if it's
@@ -86,16 +88,18 @@ a custom suffix, set `KLANK_PROXY_DOMAIN` in the environment and add a
 one-time dnsmasq wildcard (`address=/myproject.local/127.0.0.1`) on
 the host. The dashboard is then served at the domain root itself.
 
-## Caveat: schema coupling
+## Schema coupling
 
-**The binary hardcodes klank's storage internals** — the `agents` table
-shape and the JSON format of the `ports` column (mirrored in
-`portMapping` in `main.go`, kept in sync with `storage.PortMapping`).
-It is compiled separately from klank, so if a klank upgrade ever changes
-that schema, the watcher will not fail at compile time: it logs parsing
-warnings and routes stop updating silently.
+The daemon reads klank's database directly (the `agents` table shape
+and the JSON format of the `ports` column). klank and klankd share one
+Go module: port mappings are decoded into `klankdb.PortMapping`, defined
+in a cli-free leaf package (`klank/klankdb`) so a schema change that
+affects the daemon fails the build instead of drifting silently — while
+the daemon's import graph stays free of `cli.Fatal`'s `os.Exit`, so no
+library error can ever kill the polling loop.
 
-After upgrading klank, verify the watcher still tracks it:
+After upgrading klank on a live machine, it is still worth verifying the
+watcher end to end:
 
     klank new -p smoke=9999 -n watcher-check   # inside any project
-    curl -s http://smoke.watcher-check.klank.localhost || echo "watcher out of sync — check portMapping in main.go"
+    curl -s http://smoke.watcher-check.klank.localhost || echo "watcher out of sync — restart klankd with the new binary"

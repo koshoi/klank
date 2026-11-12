@@ -9,8 +9,8 @@ running a pi coding-agent session, with this repo bind-mounted at `/work`.
 
 Keep this self-referential nature in mind while working:
 
-- Changes you make to the klank CLI (`klank/`), the agent image
-  (`Dockerfile`, `pi-entrypoint.sh`), or klankd (`klankd/`) only take effect
+- Changes you make to the klank CLI (`klank/cmd/klank`), the agent image
+  (`Dockerfile`, `pi-entrypoint.sh`), or klankd (`klank/cmd/klankd`) only take effect
   in **new** sessions/containers — your current container keeps running with
   the previously built image and binaries.
 - This container is disposable (`docker run --rm`); only `/work` persists.
@@ -59,6 +59,27 @@ Because of this:
   Then `/reload` inside pi picks the new code up in the same session. The
   runtime copy is ephemeral; the next image build takes the `extensions/`
   source automatically.
+
+## Rebuild the klank binaries when you finish a task
+
+The user runs **klank and klankd built from this repository** on their
+local machine: the `klank/` directory is bind-mounted here at `/work`, so
+binaries written into the repo appear directly on the user's machine.
+Whenever a task touches Go code under `klank/` (`cmd/klank`,
+`cmd/klankd`, or any shared package), finish by rebuilding both binaries
+so the user actually gets the change:
+
+    cd /work/klank
+    go build -o klank ./cmd/klank
+    go build -o klankd ./cmd/klankd
+
+(the outputs `klank/klank` and `klank/klankd` are gitignored). Do this
+**even if the change seems trivial** and after every related edit in a
+task — a fix that never made it into the binary did not ship. Verify
+with `go vet ./...` and, when reasonable, a quick smoke test before
+building. Pure harness/image work (extensions, `Dockerfile`,
+`pi-entrypoint.sh`) does not need this; it ships via the next image
+build instead.
 
 ## Porting from omp
 

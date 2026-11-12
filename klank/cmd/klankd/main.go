@@ -10,9 +10,9 @@
 // dies, reloaded (SIGUSR1) when the config changes. One systemd unit
 // is the entire deployment — no separate caddy service.
 //
-// Build:  CGO_ENABLED=0 go build -o klankd .
-// Run:    ./klankd            (as the klank user; see -h)
-//         sudo ./klankd -u $USER   (root for port 80, user for everything else)
+// Build:  CGO_ENABLED=0 go build -o klankd ./cmd/klankd   (from klank/)
+// Run:    ./klankd (as the klank user; see -h) or sudo ./klankd -u
+// $USER (root for port 80, user for everything else)
 package main
 
 import (
@@ -33,6 +33,8 @@ import (
 	"time"
 
 	_ "modernc.org/sqlite" // pure-Go sqlite: enables a fully static binary
+
+	"klank/klankdb"
 )
 
 // route is one proxy route: an fqdn mapped to a published host address.
@@ -43,14 +45,11 @@ type route struct {
 	portName string
 }
 
-// portMapping mirrors klank/storage.PortMapping — the JSON stored in the
-// agents.ports column. Keep in sync with klank: this binary is compiled
-// separately, so schema drift fails silently at runtime (see README).
-type portMapping struct {
-	Name      string `json:"name"`
-	Container int    `json:"container"`
-	Host      int    `json:"host"`
-}
+// Port mappings are decoded into klank's own klankdb.PortMapping: the
+// daemon lives in the same module as klank, so the agents.ports JSON
+// schema is shared at compile time instead of being mirrored by hand.
+// (klankdb is a leaf package without cli.Fatal, so a library error can
+// never os.Exit the daemon — this file logs and keeps running.)
 
 func main() {
 	log.SetFlags(log.LstdFlags)
@@ -99,7 +98,11 @@ func main() {
 		*file = filepath.Join(home, ".klank", "Caddyfile")
 	}
 	if *dbPath == "" {
-		*dbPath = filepath.Join(home, ".klank", "klank.db")
+		p, err := klankdb.DefaultPath(home)
+		if err != nil {
+			log.Fatalf("%v", err)
+		}
+		*dbPath = p
 	}
 	if _, err := os.Stat(*dbPath); err != nil {
 		log.Fatalf("klank database not readable: %v (run as the klank user, or pass -db)", err)
@@ -252,8 +255,8 @@ func main() {
 
 // loadRoutes reads every agent's named port mappings from the database.
 // A bad ports column on one agent is skipped with a warning instead of
-// failing the whole sync — the daemon must survive klank schema drift
-// (it is compiled separately from klank's storage package; see README).
+// failing the whole sync — the daemon must survive even unexpected data
+// in the database.
 func loadRoutes(db *sql.DB, domain string) ([]route, error) {
 	rows, err := db.Query(`SELECT name, coalesce(ports,'') FROM agents ORDER BY name`)
 	if err != nil {
@@ -271,7 +274,7 @@ func loadRoutes(db *sql.DB, domain string) ([]route, error) {
 		if raw == "" || raw == "-" {
 			continue
 		}
-		var ports []portMapping
+		var ports []klankdb.PortMapping
 		if err := json.Unmarshal([]byte(raw), &ports); err != nil {
 			log.Printf("agent %s: skipping bad ports column %q: %v", agent, raw, err)
 			continue

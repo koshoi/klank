@@ -4,9 +4,9 @@
 # local klank config
 .klank.toml
 
-# built binary
+# built binaries (from klank/)
 klank/klank
-klankd/klankd
+klank/klankd
 
 # go test/tooling artifacts
 *.test

@@ -326,15 +326,22 @@ Inspect it with `klank debug query "SELECT ..."` / `klank debug data`.
 ```sh
 docker build -t klank:latest .   # build the agent image
 cd klank
-go build                         # produces ./klank
+go build -o klank ./cmd/klank    # produces ./klank
+go build -o klankd ./cmd/klankd  # produces ./klankd (the host daemon)
 go vet
 ```
 
 Repository layout:
 
-- `klank/` — the CLI. `main.go` (usage, flags, dispatch), `cli/` (debug/error
+- `klank/` — one Go module containing both binaries, built from `cmd/`:
+  `cmd/klank` (the CLI: usage, flags, dispatch) and `cmd/klankd` (the
+  host-side caddy daemon; see `cmd/klankd/README.md`). Shared packages:
+  `klankdb/` (the on-disk contract both binaries share — database
+  location and the `PortMapping` JSON schema; deliberately leaf,
+  no `cli` import, so the daemon can never inherit an `os.Exit`),
+  `cli/` (debug/error
   output, text/json printing), `config/` (TOML config + env files),
-  `storage/` (sqlite database), `command/` (one file per command plus
+  `storage/` (sqlite database, owned by the CLI), `command/` (one file per command plus
   shared `docker.go`/`tmux.go` helpers), `bridge.ts` (the pi bridge
   extension, copied into the image).
 - `Dockerfile` — the agent image.
