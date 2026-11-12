@@ -19,7 +19,7 @@
  */
 
 import { CustomEditor, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { matchesKey, visibleWidth } from "@earendil-works/pi-tui";
 
 type Pos = { line: number; col: number };
 type MotionResult = { pos: Pos; linewise?: boolean; inclusive?: boolean };
@@ -974,13 +974,31 @@ private modeLabel(): string {
 
 	/** Prepend the mode label + one plain space to the first prompt line, before the text/cursor. */
 	protected override render(width: number): string[] {
-		const lines = super.render(width);
+		// Reserve the label's width plus its separating space in the text layout
+		// itself: rendering at the full width and truncating afterwards chopped
+		// the tail off the first prompt line once the text reached the right edge
+		// (it overflowed instead of wrapping). Rendering at
+		// (width - labelWidth - 1) wraps every line where the label ends, and
+		// prepending is then a pure no-overflow shift.
 		const label = this.modeLabel();
+		const labelWidth = visibleWidth(label);
+		const lines = super.render(Math.max(width - labelWidth - 1, 20));
 		// lines[0] is the top border; lines[1] is the first prompt/content line.
 		// Prepending is cursor-safe: the TUI locates the cursor by searching for
 		// CURSOR_MARKER inside the rendered line, so the label just shifts it.
 		if (lines.length > 2) {
-			lines[1] = truncateToWidth(label + " " + lines[1], width, "");
+			lines[1] = label + " " + lines[1];
+		}
+		// super.render drew the borders at the reduced width; stretch them back
+		// to the full terminal width so the editor box still spans edge to edge.
+		const filler = this.borderColor("─".repeat(labelWidth));
+		lines[0] += filler;
+		// The bottom border sits right after the visible layout lines (the count
+		// is private but is set during super.render); autocomplete lines, which
+		// render below the bottom border, may follow it.
+		const visibleLineCount = (this as unknown as { renderedVisibleLineCount?: number }).renderedVisibleLineCount;
+		if (typeof visibleLineCount === "number" && lines.length > visibleLineCount + 1) {
+			lines[visibleLineCount + 1] += filler;
 		}
 		return lines;
 	}
