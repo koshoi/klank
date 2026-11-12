@@ -14,6 +14,7 @@ RUN apt-get update \
     libxkbcommon0 libatspi2.0-0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 \
     libgbm1 libasound2 libpango-1.0-0 libcairo2 libxi6 libxtst6 libglib2.0-0 \
     fonts-liberation fonts-noto-color-emoji \
+    imagemagick fonts-inter fonts-open-sans fonts-roboto \
   && rm -rf /var/lib/apt/lists/* \
   && echo 'ALL ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/all-users \
   && chmod 0440 /etc/sudoers.d/all-users
@@ -21,11 +22,16 @@ RUN apt-get update \
 # Playwright + Chromium browsers for web-app development/testing from inside
 # sessions (navigation, clicks, form fills, JS eval, screenshots). Browsers go
 # to a shared, writable-by-any-user dir (PLAYWRIGHT_BROWSERS_PATH) instead of
-# $HOME/.cache so they work under any runtime uid. Network-heavy: kept early
-# per layer discipline.
+# $HOME/.cache so they work under any runtime uid. Alongside: pixelmatch+pngjs
+# (screenshot pixel-diffing), axe-core (accessibility audits — inject
+# require('axe-core').source into the page and page.evaluate(axe.run)).
+# NODE_PATH makes all of these require-able from anywhere without a local
+# npm install (ESM `import` ignores NODE_PATH — use createRequire or CJS).
+# Network-heavy: kept early per layer discipline.
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
+ENV NODE_PATH=/usr/local/lib/node_modules
 RUN set -eux; \
-  npm install -g playwright; \
+  npm install -g playwright pixelmatch pngjs axe-core; \
   npx --yes playwright install chromium; \
   chmod -R a+rwX /opt/ms-playwright
 
@@ -123,6 +129,11 @@ COPY keybindings.json /opt/pi-agent/keybindings.json
 
 # system-prompt addendum: appended to pi's system prompt
 COPY APPEND_SYSTEM.md /opt/pi-agent/APPEND_SYSTEM.md
+
+# serve-static: zero-dep static file server for frontend testing inside
+# sessions (usage: serve-static [dir] [port])
+COPY bin/serve-static.mjs /usr/local/bin/serve-static
+RUN chmod +x /usr/local/bin/serve-static
 
 # entrypoint: auto-login to opencode from env + preselect default model
 COPY pi-entrypoint.sh /usr/local/bin/pi-entrypoint.sh
