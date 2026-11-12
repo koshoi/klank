@@ -229,6 +229,14 @@ for `list`, `get`, `debug`), `-h` (help).
   database (see `klank port`) and written to `/ports` inside the
   container, where the system-prompt addendum tells the agent to look
   them up.
+- `-f, --file <file>` — stage the file in a scratch directory under
+  `/tmp` (named after the first file) and mount that directory at
+  `/work` instead of the current one, so the agent works on just the
+  given files in isolation. Repeatable (`-f main.go -f util.go`). The
+  scratch directory is removed when the agent's container exits; if
+  you detach while it still runs, its path is printed. Files must be
+  regular files with distinct names. The default agent name is the
+  first file's name.
 
 `new` also takes the agent name as a positional argument (`klank new
 myagent`); when started outside tmux it is also the tmux session name.

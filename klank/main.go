@@ -91,6 +91,13 @@ new flags:
                    The local port is picked free and close to the
                    container port; mappings are saved in the agent
                    database and in the container's /ports file
+  -f, --file FILE  stage the file in a scratch directory under /tmp
+                   (named after the first file) and mount that directory
+                   at /work instead of the current one: the agent works
+                   on just the given files in isolation; repeatable
+                   (e.g. -f main.go -f util.go). The scratch dir is
+                   removed when the agent's container exits; the default
+                   agent name is the first file's name
 
 send flags:
   -w, --wait       wait until the agent settles after the message
@@ -103,6 +110,7 @@ examples:
   klank new -e FOO=bar -e BAZ=qux --allow-home
   klank new --ipv6
   klank new -p http=80 -p http2=8080 -p grpc=8000
+  klank new -f main.go -f go.mod
   klank port worker http
   klank curl agent001 /status
   klank curl agent001 /send -d 'test'

@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -223,6 +224,106 @@ func reapAfterAttach(db *sql.DB, cid string) {
 	}
 }
 
+// stagedFile is one validated -f input: absolute source path, destination
+// basename and the file mode to preserve.
+type stagedFile struct {
+	src, base string
+	mode      os.FileMode
+}
+
+// planFiles validates every -f file (exists, regular, distinct basenames)
+// without touching the filesystem beyond stat. Splitting validation from
+// copying lets `klank new` fail on bad input before creating anything, and
+// defer the scratch-dir creation until after all other pre-launch checks
+// (tmux presence, name conflicts, env parsing) have passed.
+func planFiles(files []string) (plan []stagedFile, stem string) {
+	stem = "file"
+	base := filepath.Base(files[0])
+	if s := strings.TrimSuffix(base, filepath.Ext(base)); s != "" {
+		stem = strings.NewReplacer(".", "_", ":", "_").Replace(s)
+	}
+	seen := map[string]bool{} // detect two -f files with the same basename
+	for _, f := range files {
+		src, err := filepath.Abs(f)
+		if err != nil {
+			cli.Fatal("resolve %s: %v", f, err)
+		}
+		info, err := os.Stat(src)
+		if err != nil {
+			cli.Fatal("stat %s: %v", f, err)
+		}
+		if !info.Mode().IsRegular() {
+			cli.Fatal("not a regular file: %s", f)
+		}
+		base := filepath.Base(src)
+		if seen[base] {
+			cli.Fatal("two files share the name %s; give one a different name", base)
+		}
+		seen[base] = true
+		plan = append(plan, stagedFile{src, base, info.Mode().Perm()})
+	}
+	return plan, stem
+}
+
+// copyStaged creates the scratch directory under /tmp named after the
+// first file (klank-<stem>-<random>) and copies the planned files into
+// it. It is the backing for `klank new -f`: the container mounts this
+// scratch dir at /work instead of the cwd, so the agent works on just
+// the given files in an isolated environment.
+func copyStaged(plan []stagedFile, stem string) string {
+	dir, err := os.MkdirTemp("", "klank-"+stem+"-")
+	if err != nil {
+		cli.Fatal("create scratch dir: %v", err)
+	}
+	for _, s := range plan {
+		in, err := os.Open(s.src)
+		if err != nil {
+			cli.Fatal("open %s: %v", s.src, err)
+		}
+		dst := filepath.Join(dir, s.base)
+		out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, s.mode)
+		if err != nil {
+			in.Close()
+			cli.Fatal("create %s: %v", dst, err)
+		}
+		if _, err := io.Copy(out, in); err != nil {
+			in.Close()
+			out.Close()
+			cli.Fatal("copy %s: %v", s.src, err)
+		}
+		if err := out.Close(); err != nil {
+			in.Close()
+			cli.Fatal("close %s: %v", dst, err)
+		}
+		in.Close()
+		cli.Debug("staged %s -> %s", s.src, dst)
+	}
+	return dir
+}
+
+// removeStagedFiles cleans up the -f scratch dir after attach: when the
+// container has exited (--rm removed it) nothing needs the dir, so it is
+// deleted; when the user detached and the agent still runs, deleting the
+// dir would pull /work out from under it, so the dir is kept and its path
+// reported instead. A no-op for plain `klank new` (empty dir).
+func removeStagedFiles(dir, cid string) {
+	if dir == "" {
+		return
+	}
+	switch dockerAlive(cid) {
+	case dockerRunning:
+		fmt.Printf("agent still running; keeping scratch dir %s\n", dir)
+	case dockerUnknown:
+		cli.Warn("docker unavailable; keeping scratch dir %s", dir)
+	default: // dockerMissing (--rm already removed it) or dockerStopped (exited)
+		if err := os.RemoveAll(dir); err != nil {
+			cli.Warn("remove scratch dir %s: %v", dir, err)
+		} else {
+			cli.Debug("removed scratch dir %s", dir)
+		}
+	}
+}
+
 // New implements `klank new`: launch an agent container, record it and
 // attach to it (directly when inside tmux, via a dedicated tmux session
 // otherwise).
@@ -237,6 +338,7 @@ func New(db *sql.DB, cfg *config.Config, args []string) {
 	}
 	var portFlags []namedPort // ordered -p name=container-port occurrences
 	portNames := map[string]bool{}
+	var fileArgs []string // -f files to stage in a scratch dir
 	allowHome := false
 	useIPv6 := cfg.UseIPv6() // opt-in default (config: ipv6 = true)
 	for i := 0; i < len(args); i++ {
@@ -256,6 +358,12 @@ func New(db *sql.DB, cfg *config.Config, args []string) {
 				cli.Fatal("agent name given twice (%s and an earlier name)", a)
 			}
 			name = args[i+1]
+			i++
+		case "-f", "--file":
+			if i+1 >= len(args) {
+				cli.Fatal("%s requires a value", a)
+			}
+			fileArgs = append(fileArgs, args[i+1])
 			i++
 		case "--allow-home":
 			allowHome = true
@@ -288,14 +396,24 @@ func New(db *sql.DB, cfg *config.Config, args []string) {
 		}
 	}
 	cwd := cli.MustCwd()
-	if name == "" {
-		name = agentNameFromCwd(cwd)
-		cli.Debug("defaulted agent name from cwd: %s", name)
-	}
-	if !allowHome {
+	var filePlan []stagedFile // validated -f inputs (nil for a plain launch)
+	var stageDir, stageStem string
+	if len(fileArgs) > 0 {
+		filePlan, stageStem = planFiles(fileArgs)
+		if name == "" {
+			name = stageStem
+			cli.Debug("defaulted agent name from first -f file: %s", name)
+		}
+		// with -f the cwd itself is never mounted (only file copies are),
+		// so the home-mount guard does not apply
+	} else if !allowHome {
 		guardHomeMount(cwd)
 	} else {
 		cli.Debug("--allow-home: skipping home directory mount guard")
+	}
+	if name == "" && filePlan == nil {
+		name = agentNameFromCwd(cwd)
+		cli.Debug("defaulted agent name from cwd: %s", name)
 	}
 	image := imageName
 	if image == "" {
@@ -360,6 +478,13 @@ func New(db *sql.DB, cfg *config.Config, args []string) {
 		if tmuxHasSession(name) {
 			cli.Fatal("tmux session %s already exists", name)
 		}
+	}
+
+	// all pre-launch checks passed: stage the -f files into their scratch
+	// dir, which the container mounts at /work instead of the cwd
+	if filePlan != nil {
+		stageDir = copyStaged(filePlan, stageStem)
+		cwd = stageDir
 	}
 
 	fmt.Printf("launching container (image: %s)...\n", image)
@@ -440,6 +565,7 @@ func New(db *sql.DB, cfg *config.Config, args []string) {
 		fmt.Println("attaching...")
 		dockerAttach(cid)
 		reapAfterAttach(db, cid)
+		removeStagedFiles(stageDir, cid)
 		return
 	}
 
@@ -452,4 +578,5 @@ func New(db *sql.DB, cfg *config.Config, args []string) {
 	fmt.Printf("attaching to tmux session %s...\n", ident.session)
 	tmuxAttachClient(ident.session, ident.pane)
 	reapAfterAttach(db, cid)
+	removeStagedFiles(stageDir, cid)
 }
