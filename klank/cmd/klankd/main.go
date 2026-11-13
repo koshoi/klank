@@ -153,8 +153,8 @@ func main() {
 		// Dashboard files are served straight from disk by caddy's
 		// file_server; updating them needs no reload.
 		for _, f := range []struct{ path, content string }{
-			{filepath.Join(dir, "index.html"), renderDashboard(routes, *domain)}, // named index.html so caddy's file_server serves it at /
-			{filepath.Join(dir, "klank-agents.json"), agentsJSON(routes)},
+			{filepath.Join(dir, "index.html"), renderDashboard(routes, *domain, *httpPort)}, // named index.html so caddy's file_server serves it at /
+			{filepath.Join(dir, "klank-agents.json"), agentsJSON(routes, *httpPort)},
 		} {
 			if c, err := writeIfChanged(f.path, f.content, runAsUID, runAsGID); err != nil {
 				log.Printf("write %s: %v", f.path, err)
@@ -375,9 +375,20 @@ func groupByAgent(routes []route) []struct {
 	return groups
 }
 
+// siteURL renders a browser-facing URL for a site host. When caddy
+// listens on a non-standard port (-http-port, e.g. 8080 for an
+// unprivileged daemon) the URL must carry that port explicitly — the
+// browser has no root proxy rewriting it back to port 80.
+func siteURL(host string, httpPort int) string {
+	if httpPort == 80 {
+		return "http://" + host
+	}
+	return fmt.Sprintf("http://%s:%d", host, httpPort)
+}
+
 // agentsJSON is the JSON feed the dashboard page polls to refresh
 // itself without a reload.
-func agentsJSON(routes []route) string {
+func agentsJSON(routes []route, httpPort int) string {
 	type port struct {
 		Name     string `json:"name"`
 		URL      string `json:"url"`
@@ -391,7 +402,7 @@ func agentsJSON(routes []route) string {
 	for _, g := range groupByAgent(routes) {
 		a := agent{Name: g.agent, Ports: []port{}}
 		for _, r := range g.ports {
-			a.Ports = append(a.Ports, port{r.portName, "http://" + r.fqdn, r.upstream})
+			a.Ports = append(a.Ports, port{r.portName, siteURL(r.fqdn, httpPort), r.upstream})
 		}
 		out = append(out, a)
 	}
@@ -419,7 +430,7 @@ const dashboardStyle = `
 // (works without JS); the inline script re-fetches klank-agents.json
 // every few seconds to pick up new agents without a reload, preserving
 // which agents are expanded.
-func renderDashboard(routes []route, domain string) string {
+func renderDashboard(routes []route, domain string, httpPort int) string {
 	var b strings.Builder
 	b.WriteString(`<!doctype html><html><head><meta charset="utf-8">`)
 	b.WriteString(`<title>klank services</title><style>`)
@@ -434,8 +445,8 @@ func renderDashboard(routes []route, domain string) string {
 		fmt.Fprintf(&b, `<details id="agent-%d"%s><summary>%s <span class="count">(%d)</span></summary><ul>`,
 			i, openAttr(i), html.EscapeString(g.agent), len(g.ports))
 		for _, r := range g.ports {
-			fmt.Fprintf(&b, `<li><a href="http://%s/">%s</a><span class="upstream">%s</span></li>`,
-				html.EscapeString(r.fqdn), html.EscapeString(r.portName), html.EscapeString(r.upstream))
+			fmt.Fprintf(&b, `<li><a href="%s/">%s</a><span class="upstream">%s</span></li>`,
+				html.EscapeString(siteURL(r.fqdn, httpPort)), html.EscapeString(r.portName), html.EscapeString(r.upstream))
 		}
 		b.WriteString(`</ul></details>`)
 	}
