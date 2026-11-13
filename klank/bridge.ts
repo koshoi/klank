@@ -12,6 +12,22 @@
 //   POST /message    body = message text, injected as a user message
 //                    (?wait=1 holds the response until the agent settles)
 //
+// Outbox (agent -> host push channel, consumed by klankd over SSE):
+//
+//   POST /outbox     body {type, data}; enqueue -> {id} (types validated
+//                    against the registry, unknown -> 400)
+//   GET  /events     SSE stream for klankd: replays all unacked messages on
+//                    connect (?since=<id> skips older ones), then streams
+//                    new items as they are enqueued; `: ping` heartbeat
+//   POST /ack        body {ids: [...]}; remove processed items (idempotent)
+//   POST /inbox      body {replyTo, ok, data}; result for an outbox item
+//   GET  /outbox/:id/result
+//                    the stored result for an item (404 until one arrives)
+//
+// The tool-side flow: POST /outbox, klankd consumes via /events, handles,
+// POSTs the outcome to /inbox, then POSTs /ack. Unacked items are
+// redelivered on every /events (re)connect.
+//
 // All responses are JSON. Delivery follows the same rules as typing in the
 // TUI: when the agent is idle the message starts a new run, mid-run it is
 // queued as steering (delivered after the current tool calls finish).
@@ -21,6 +37,7 @@
 // and injected exactly like POST /message; .sent/.done/.error receipt files
 // are written next to them.
 
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as http from "node:http";
 import * as path from "node:path";
@@ -142,9 +159,73 @@ export default function (pi: ExtensionAPI) {
 		drain(); // pick up anything that arrived before startup
 	});
 
+	// ---- agent -> host outbox (SSE + ack) ----
+
+	// Messages the agent can push to the host. klankd is the only intended
+	// consumer; new types must be registered here AND handled by klankd
+	// (klank/cmd/klankd/consumer.go) in the same release.
+	const OUTBOX_TYPES = new Set(["show_diagram"]);
+	const OUTBOX_CAP = 64; // unacked items kept; oldest dropped beyond this
+	const RESULTS_CAP = 256; // stored results kept; oldest dropped beyond this
+	// mermaid sources larger than this produce mermaid.live URL fragments
+	// (~1.33x after base64) that some browsers/mermaid.live silently fail to
+	// restore — reject them here so the tool reports an actionable error
+	// instead of a possibly-dead browser tab.
+	const MAX_MERMAID = 200 * 1024;
+
+	type OutboxItem = { id: string; v: 1; type: string; ts: number; data: unknown };
+
+	const outbox: OutboxItem[] = []; // unacked, oldest first
+	const results = new Map<string, { ok: boolean; data: unknown }>(); // replyTo -> result
+	const sseClients = new Set<http.ServerResponse>();
+
+	// uuidv7-ish id: 48-bit ms timestamp hex + random tail. Fixed width and
+	// time-ordered, so lexicographic comparison is chronological — this is
+	// what makes `?since=<id>` reconnects and result lookup well-defined.
+	const makeId = (): string => {
+		const ts = Date.now().toString(16).padStart(12, "0");
+		return ts + crypto.randomBytes(10).toString("hex");
+	};
+
+	// validateOutboxData type-checks the payload of a registered type;
+	// returns null when valid, else a human-readable reason.
+	const validateOutboxData = (type: string, data: unknown): string | null => {
+		if (type === "show_diagram") {
+			const d = (data ?? {}) as { mermaid?: unknown; title?: unknown };
+			if (typeof d.mermaid !== "string" || !d.mermaid.trim()) return "data.mermaid must be a non-empty string";
+			if (d.mermaid.length > MAX_MERMAID)
+				return `data.mermaid is too large (${d.mermaid.length} bytes; max ${MAX_MERMAID}) — simplify or split the diagram`;
+			if (d.title !== undefined && typeof d.title !== "string") return "data.title must be a string";
+		}
+		return null;
+	};
+
+	const sseWrite = (res: http.ServerResponse, item: OutboxItem) => {
+		res.write(`id: ${item.id}\ndata: ${JSON.stringify(item)}\n\n`);
+	};
+
+	const enqueue = (type: string, data: unknown): OutboxItem => {
+		if (outbox.length >= OUTBOX_CAP) {
+			const dropped = outbox.shift();
+			console.error(`[klank-bridge] outbox full; dropped unacked ${dropped?.type} ${dropped?.id}`);
+		}
+		const item: OutboxItem = { id: makeId(), v: 1, type, ts: Date.now(), data };
+		outbox.push(item);
+		for (const client of sseClients) sseWrite(client, item);
+		return item;
+	};
+
+	const outboxResultPayload = (id: string) => {
+		const r = results.get(id);
+		return r ? { id, ok: r.ok, data: r.data } : null;
+	};
+
 	pi.on("session_shutdown", () => {
 		watcher?.close();
 		watcher = null;
+		// drop SSE consumers so server.close() can actually complete
+		for (const client of sseClients) client.end();
+		sseClients.clear();
 		server.close();
 	});
 
@@ -211,6 +292,11 @@ export default function (pi: ExtensionAPI) {
 			{ method: "GET", path: "/status", description: "agent state: busy/idle, model, session, context usage" },
 			{ method: "GET", path: "/messages", description: "recent transcript messages, newest-first (?from=0 offset, ?limit=1, ?role=user,assistant,tool, ?text=1 flattens content to text; tool messages include the originating toolCall)" },
 			{ method: "POST", path: "/message", description: "inject a user message (body = text; ?wait=1 long-polls until the agent settles)" },
+			{ method: "POST", path: "/outbox", description: `enqueue an agent->host message (body {type, data}; types: ${[...OUTBOX_TYPES].join(", ")}) -> {id}` },
+			{ method: "GET", path: "/events", description: "SSE stream of unacked outbox messages (all replayed on connect; ?since=<id> skips older ones); heartbeat comments every 15s" },
+			{ method: "POST", path: "/ack", description: "acknowledge processed outbox messages (body {ids: [...]}); idempotent — unknown ids are fine" },
+			{ method: "POST", path: "/inbox", description: "deliver the result for an outbox message (body {replyTo, ok, data})" },
+			{ method: "GET", path: "/outbox/:id/result", description: "the result delivered for an outbox message (404 until one arrives)" },
 		],
 	});
 
@@ -406,6 +492,102 @@ export default function (pi: ExtensionAPI) {
 				await new Promise<void>((resolve) => waiters.push(resolve));
 				json(res, 200, { status: "done" });
 				return;
+			}
+			if (req.method === "POST" && url.pathname === "/outbox") {
+				let body: { type?: unknown; data?: unknown };
+				try {
+					body = JSON.parse(await readBody(req) || "{}");
+				} catch {
+					json(res, 400, { error: "invalid JSON body" });
+					return;
+				}
+				const type = body.type;
+				if (typeof type !== "string" || !OUTBOX_TYPES.has(type)) {
+					json(res, 400, { error: `unknown outbox type: ${String(type)} (allowed: ${[...OUTBOX_TYPES].join(", ")})` });
+					return;
+				}
+				const invalid = validateOutboxData(type, body.data);
+				if (invalid) {
+					json(res, 400, { error: invalid });
+					return;
+				}
+				const item = enqueue(type, body.data);
+				json(res, 200, { id: item.id });
+				return;
+			}
+			if (req.method === "GET" && url.pathname === "/events") {
+				res.writeHead(200, {
+					"content-type": "text/event-stream",
+					"cache-control": "no-cache",
+					connection: "keep-alive",
+				});
+				// at-least-once delivery: replay unacked on connect. An item that
+				// was handled but never acked (deliver failed after handling, or
+				// the ack POST itself failed) is redelivered here — possibly more
+				// than once; handlers must tolerate that. ?since=<id> trims the
+				// replay to strictly newer items.
+				const since = url.searchParams.get("since") || "";
+				for (const item of outbox) {
+					if (since && item.id <= since) continue;
+					sseWrite(res, item);
+				}
+				sseClients.add(res);
+				const ping = setInterval(() => res.write(": ping\n\n"), 15_000);
+				req.on("close", () => {
+					clearInterval(ping);
+					sseClients.delete(res);
+				});
+				return;
+			}
+			if (req.method === "POST" && url.pathname === "/ack") {
+				let body: { ids?: unknown };
+				try {
+					body = JSON.parse(await readBody(req) || "{}");
+				} catch {
+					json(res, 400, { error: "invalid JSON body" });
+					return;
+				}
+				const ids = Array.isArray(body.ids) ? body.ids.filter((v): v is string => typeof v === "string") : [];
+				const acked = new Set(ids);
+				// filter in place: idempotent — unknown ids are simply no-ops
+				for (let i = outbox.length - 1; i >= 0; i--) {
+					if (acked.has(outbox[i].id)) outbox.splice(i, 1);
+				}
+				json(res, 200, { acked: ids.length });
+				return;
+			}
+			if (req.method === "POST" && url.pathname === "/inbox") {
+				let body: { replyTo?: unknown; ok?: unknown; data?: unknown };
+				try {
+					body = JSON.parse(await readBody(req) || "{}");
+				} catch {
+					json(res, 400, { error: "invalid JSON body" });
+					return;
+				}
+				if (typeof body.replyTo !== "string" || !body.replyTo) {
+					json(res, 400, { error: "replyTo must be a non-empty string" });
+					return;
+				}
+				if (results.size >= RESULTS_CAP) {
+					const oldest = results.keys().next().value;
+					if (oldest !== undefined) results.delete(oldest);
+				}
+				results.set(body.replyTo, { ok: Boolean(body.ok), data: body.data ?? null });
+				json(res, 200, { ok: true });
+				return;
+			}
+			{
+				// GET /outbox/:id/result
+				const m = req.method === "GET" ? url.pathname.match(/^\/outbox\/([^/]+)\/result$/) : null;
+				if (m) {
+					const payload = outboxResultPayload(decodeURIComponent(m[1]));
+					if (!payload) {
+						json(res, 404, { error: `no result (yet) for ${m[1]}` });
+						return;
+					}
+					json(res, 200, payload);
+					return;
+				}
 			}
 			json(res, 404, { error: `no such endpoint: ${req.method} ${url.pathname}` });
 		} catch (err) {

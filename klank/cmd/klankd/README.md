@@ -64,9 +64,40 @@ under a wrapper that grants `CAP_NET_BIND_SERVICE`.
 
 Flags (see `-h`): `-i` poll interval, `-f` Caddyfile path (dashboard
 files are written next to it), `-d` domain suffix, `-caddy` path to
-the caddy binary, `-db` database path, `--once` (sync once, no caddy).
+the caddy binary, `-db` database path, `-open-command` command to open
+diagram URLs on the host, `-http-port` listen port (see below),
+`--once` (sync once, no caddy).
 Defaults: poll 750ms, `~/.klank/Caddyfile`, domain from
 `$KLANK_PROXY_DOMAIN` or `klank.localhost`.
+
+### Running unprivileged (recommended over sudo)
+
+The daemon needs no root if nothing it starts binds port 80. Two ways
+to free the daemon (and its supervised caddy) from port 80:
+
+1. `setcap 'cap_net_bind_service=+ep' $(which caddy)` — the supervised
+   caddy keeps binding 80; the daemon runs as your user. Simplest.
+2. **Root proxy in front** — run a minimal root caddy (or any port-80
+   reverse proxy) that forwards to the daemon's caddy on an unprivileged
+   port, and tell klankd about it:
+
+       # root Caddyfile, e.g. /etc/caddy/klank-front:80
+       :80 {
+       	reverse_proxy 127.0.0.1:8080
+       }
+
+       ./klankd -http-port 8080
+
+   The generated site addresses become `http://<name>:8080` (listen
+   port only — matching stays by hostname, and the port-80 proxy
+   forwards a portless Host header untouched). Because the daemon now
+   runs as the desktop user, it inherits `DISPLAY`/`DBUS` and
+   `show_diagram` browser-opening just works — running the daemon via
+   sudo does not, since root has no path to the user's graphical
+   session (the spawned opener exits immediately with status 3).
+
+The dashboard's links are always rendered on port 80 (via the front
+proxy) regardless of `-http-port`.
 
 ### Running under sudo
 
@@ -83,10 +114,45 @@ the supervised caddy's `HOME`/`USER` there. Caddy itself keeps the
 daemon's privileges so it can still bind port 80.
 
 `*.klank.localhost` (including `klank.localhost` itself) resolves to
-127.0.0.1 out of the box on systemd-resolved and modern browsers. For
+127.0.0.1 out of the box on most modern Linux systems and browsers. For
 a custom suffix, set `KLANK_PROXY_DOMAIN` in the environment and add a
 one-time dnsmasq wildcard (`address=/myproject.local/127.0.0.1`) on
 the host. The dashboard is then served at the domain root itself.
+
+## Agent outbox (show_diagram)
+
+Every agent's control server (bridge.ts) exposes an agent→host push
+channel: the agent enqueues typed messages (POST /outbox), the daemon
+streams them over SSE (GET /events) and acknowledges what it handled
+(POST /ack). The daemon keeps one SSE consumer per running agent,
+reconciled with the database on every poll tick; a handler that fails
+is not acked, so the bridge redelivers on the next reconnect.
+
+Agents whose bridge predates the outbox (old image, container not
+rebuilt) have no `/events` endpoint; their consumer disables itself on
+the first 404 instead of retrying forever and flooding the log. It
+comes back automatically once the agent's port changes — i.e. its
+container was recreated with a current image.
+
+The first message type is `show_diagram`: the agent sends mermaid
+source, the daemon encodes it into a mermaid.live URL
+(`https://mermaid.live/edit#<base64url(JSON state)>`) and opens it in
+a browser on the host — `-open-command` if given, else `firefox
+--new-window` (its own window per diagram, not a tab in the existing
+one). The outcome (URL, or a failure note) is delivered back
+to the container (POST /inbox) so the agent-side `show_diagram` tool
+can report it to the model.
+
+Delivery is **at-least-once**: an item that was handled but whose
+deliver or ack failed (e.g. the bridge was briefly unreachable) is
+replayed on the next connect and handled again — for `show_diagram`
+that means a second browser tab, which is accepted. Mermaid payloads
+larger than 200 KB are rejected by the bridge (very large mermaid.live
+URLs fail to restore silently in some browsers).
+
+`-open-command` is split on spaces, so paths/arguments containing
+spaces (e.g. `/Applications/Google Chrome.app/...`) are not supported;
+use a wrapper script for those.
 
 ## Schema coupling
 

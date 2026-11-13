@@ -123,6 +123,10 @@ COPY extensions/modal-editor.ts /opt/pi-agent/extensions/modal-editor.ts
 # visually distinct from model output on color-poor terminals)
 COPY extensions/user-borders.ts /opt/pi-agent/extensions/user-borders.ts
 
+# show-diagram extension: agent tool that pushes mermaid diagrams to the
+# host through the bridge outbox (klankd opens them in the user's browser)
+COPY extensions/show-diagram.ts /opt/pi-agent/extensions/show-diagram.ts
+
 # keybindings: up/down arrows scroll the transcript instead of browsing
 # prompt history (fullscreen TUI mode)
 COPY keybindings.json /opt/pi-agent/keybindings.json

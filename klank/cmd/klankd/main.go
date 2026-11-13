@@ -7,7 +7,7 @@
 // 127.0.0.1:<host>, e.g. http.myproject.klank.localhost), and serves a
 // dashboard at the domain root (klank.localhost). Caddy runs as a
 // supervised child process: started by the daemon, restarted if it
-// dies, reloaded (SIGUSR1) when the config changes. One systemd unit
+// dies, reloaded (SIGUSR1) when the config changes. One daemon process
 // is the entire deployment — no separate caddy service.
 //
 // Build:  CGO_ENABLED=0 go build -o klankd ./cmd/klankd   (from klank/)
@@ -60,7 +60,9 @@ func main() {
 	domain := flag.String("d", "", "domain suffix (default $KLANK_PROXY_DOMAIN or \"klank.localhost\"); the dashboard is served at the domain itself")
 	caddyBin := flag.String("caddy", "caddy", "path to the caddy binary to supervise")
 	dbPath := flag.String("db", "", "klank database path (default ~/.klank/klank.db)")
+	openCommand := flag.String("open-command", "", "command used to open diagram URLs on the host, split on spaces (paths/arguments containing spaces are not supported); default: firefox --new-window")
 	once := flag.Bool("once", false, "sync once and exit (no polling, no caddy)")
+	httpPort := flag.Int("http-port", 80, "port the supervised caddy listens on; set e.g. 8080 when a root-run caddy (or firewall rule) forwards port 80 to it — lets the daemon run unprivileged as the desktop user, which also makes diagram browser-opening work")
 	runAs := flag.String("u", "", "act on behalf of this user (name, uid, or uid:gid): ~/.klank resolves to their home and generated files are chowned to them; for sudo runs, e.g. sudo klankd -u $USER")
 	flag.Parse()
 
@@ -139,7 +141,7 @@ func main() {
 			}
 		}
 
-		changed, err := writeIfChanged(*file, renderCaddyfile(routes, *domain, dir), runAsUID, runAsGID)
+		changed, err := writeIfChanged(*file, renderCaddyfile(routes, *domain, dir, *httpPort), runAsUID, runAsGID)
 		if err != nil {
 			log.Printf("write %s: %v", *file, err)
 			return false
@@ -173,13 +175,23 @@ func main() {
 	}
 
 	// Caddy is a hard dependency — it is the thing that serves the
-	// routes and the dashboard. Fail fast (systemd retries with backoff).
+	// routes and the dashboard. Fail fast — without caddy there is nothing
+	// to do; whoever supervises the daemon decides on a restart policy.
 	// (--once skips this: it neither starts nor reloads caddy.)
 	if _, err := exec.LookPath(*caddyBin); err != nil {
 		log.Fatalf("caddy binary %q not found: %v (install caddy, or pass -caddy with the full path)", *caddyBin, err)
 	}
 
 	log.Printf("polling %s every %s; writing %s; domain .%s; dashboard at %s", *dbPath, *interval, *file, *domain, *domain)
+
+	// Agent outbox consumers: one SSE stream per running agent's control
+	// server, dispatching messages like show_diagram (see consumer.go,
+	// diagram.go). Reconciled with the database on every poll tick; not
+	// started in -once mode (that path returns before the loop).
+	consumers := newConsumerSet(map[string]handler{
+		"show_diagram": handleShowDiagram(*openCommand),
+	})
+	defer consumers.stop()
 
 	// First sync before starting caddy so it boots with current config.
 	sync()
@@ -189,7 +201,7 @@ func main() {
 
 	// startCaddyAndWait launches the supervised caddy child and wires a
 	// waiter goroutine that reports its exit to caddyExited. caddy logs
-	// to stderr, which systemd captures in the journal alongside our log.
+	// to stderr, the same stream our log goes to.
 	startCaddyAndWait := func() {
 		cmd := exec.Command(*caddyBin, "run", "--config", *file, "--adapter", "caddyfile")
 		cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
@@ -232,8 +244,12 @@ func main() {
 					log.Printf("caddy reload signal: %v (caddy may be restarting)", err)
 				}
 			}
+			// keep the outbox consumers in step with agent lifecycle:
+			// start streams for new agents, stop streams for vanished ones
+			consumers.syncDB(db)
 		case s := <-sig:
 			log.Printf("got %v, stopping caddy and exiting", s)
+			consumers.stop()
 			if caddyProc != nil {
 				_ = caddyProc.Signal(syscall.SIGTERM)
 				done := false
@@ -308,15 +324,26 @@ func loadRoutes(db *sql.DB, domain string) ([]route, error) {
 // klank-agents.json go stale for minutes-to-hours and show removed
 // agents. no-cache keeps 304 revalidation (cheap) but forces a
 // revalidation on every request, which is what a live status page needs.
-func renderCaddyfile(routes []route, domain, dashboardRoot string) string {
+func renderCaddyfile(routes []route, domain, dashboardRoot string, httpPort int) string {
 	var b strings.Builder
 	b.WriteString("# managed by klankd -- DO NOT EDIT\n")
 	// explicit http:// scheme: without it caddy treats every site as
 	// HTTPS (auto-redirect + local TLS certs), which breaks plain-http
 	// *.klank.localhost names that never leave the machine
-	b.WriteString(fmt.Sprintf("\nhttp://%s {\n\troot * %s\n\tfile_server\n\theader Cache-Control \"no-cache\"\n}\n", domain, dashboardRoot))
+	//
+	// httpPort != 80 is part of the site address (:8080) so caddy binds
+	// it — while the Host header stays portless, which is how requests
+	// arrive through a root-run proxy on port 80. Caddy matches sites
+	// by hostname regardless of the listen port.
+	siteHost := func(host string) string {
+		if httpPort == 80 {
+			return host
+		}
+		return fmt.Sprintf("%s:%d", host, httpPort)
+	}
+	b.WriteString(fmt.Sprintf("\nhttp://%s {\n\troot * %s\n\tfile_server\n\theader Cache-Control \"no-cache\"\n}\n", siteHost(domain), dashboardRoot))
 	for _, r := range routes {
-		b.WriteString(fmt.Sprintf("\nhttp://%s {\n\treverse_proxy %s\n}\n", r.fqdn, r.upstream))
+		b.WriteString(fmt.Sprintf("\nhttp://%s {\n\treverse_proxy %s\n}\n", siteHost(r.fqdn), r.upstream))
 	}
 	// no trailing blank line: keeps the output byte-identical to
 	// `caddy fmt`, so caddy never logs the "input is not formatted" warning
